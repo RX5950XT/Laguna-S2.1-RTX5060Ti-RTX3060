@@ -1,0 +1,556 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RX5950XT <123271969+RX5950XT@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 12:15:31 +0800
+Subject: [PATCH 1/6] feat: port Pulsar runtime to Windows
+
+
+diff --git a/.gitignore b/.gitignore
+index a799baf..d2ef699 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,4 +1,6 @@
+ target/
++/.cache/
++/build/
+ Cargo.lock
+ *.bin.tmp
+ .gitnexus
+diff --git a/crates/engine/src/bin/pulsar-cli.rs b/crates/engine/src/bin/pulsar-cli.rs
+index f00cf16..cda8666 100644
+--- a/crates/engine/src/bin/pulsar-cli.rs
++++ b/crates/engine/src/bin/pulsar-cli.rs
+@@ -14,13 +14,13 @@
+ //! --chat: resolve embed → cache → HF → llama.cpp catalog (network
+ //! blocked only by PULSAR_OFFLINE).
+ 
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+ fn main() {
+-    eprintln!("pulsar-cli requires Linux + CUDA");
++    eprintln!("pulsar-cli requires Linux/Windows + CUDA");
+     std::process::exit(1);
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn main() {
+     if let Err(e) = run() {
+         eprintln!("pulsar-cli: {e}");
+@@ -30,7 +30,7 @@ fn main() {
+ 
+ /// Flush the longest valid UTF-8 prefix of `buf` to stdout, keeping any
+ /// incomplete trailing multi-byte sequence for the next token.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ #[allow(dead_code)] // used by the streaming chat path; dead in --chat-less builds
+ fn print_utf8_prefix(buf: &mut Vec<u8>) {
+     use std::io::Write;
+@@ -48,7 +48,7 @@ fn print_utf8_prefix(buf: &mut Vec<u8>) {
+ }
+ 
+ /// Encode a multi-turn history through a resolved Jinja template.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn encode_chat_jinja(
+     tok: &tokenizer::Tokenizer,
+     template: &tokenizer::ResolvedChatTemplate,
+@@ -71,7 +71,7 @@ fn encode_chat_jinja(
+     Ok(tok.encode_with_specials(&rendered))
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ #[allow(clippy::too_many_arguments)]
+ fn run_chat(
+     model: &engine::Model,
+@@ -275,7 +275,7 @@ fn run_chat(
+     Ok(())
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn run() -> engine::Result {
+     let mut model_path = None;
+     let mut prompt = None;
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 3a270ec..f33fe99 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -13,7 +13,7 @@
+ //! always receive explicit per-slot device pointers, wherever the bytes
+ //! ended up.
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ mod real {
+     /// Bytes per GiB. Memory sizes are reported in GiB everywhere so a
+     /// printed number can be compared directly against a card's capacity;
+@@ -28,7 +28,6 @@ mod real {
+     pub use qwen35::{generate_dflash, DraftModel};
+ 
+     use std::fs::File;
+-    use std::os::unix::fs::FileExt;
+     use std::path::Path;
+ 
+     use gguf::{Gguf, TensorInfo, TensorType, Value};
+@@ -36,6 +35,43 @@ mod real {
+ 
+     pub type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+ 
++    trait FileReadAt {
++        fn read_at_compat(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize>;
++        fn read_exact_at_compat(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
++    }
++
++    #[cfg(target_os = "linux")]
++    impl FileReadAt for File {
++        fn read_at_compat(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
++            std::os::unix::fs::FileExt::read_at(self, buf, offset)
++        }
++
++        fn read_exact_at_compat(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
++            std::os::unix::fs::FileExt::read_exact_at(self, buf, offset)
++        }
++    }
++
++    #[cfg(target_os = "windows")]
++    impl FileReadAt for File {
++        fn read_at_compat(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
++            use std::os::windows::fs::FileExt;
++            self.seek_read(buf, offset)
++        }
++
++        fn read_exact_at_compat(&self, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
++            use std::os::windows::fs::FileExt;
++            while !buf.is_empty() {
++                let read = self.seek_read(buf, offset)?;
++                if read == 0 {
++                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
++                }
++                offset += read as u64;
++                buf = &mut buf[read..];
++            }
++            Ok(())
++        }
++    }
++
+     fn meta_err(key: &str) -> Box<dyn std::error::Error> {
+         format!("gguf metadata missing/bad: {key}").into()
+     }
+@@ -2257,7 +2293,7 @@ mod real {
+         let mut n = HEAD_READ_START;
+         loop {
+             let mut head = vec![0u8; n];
+-            let got = file.read_at(&mut head, 0)?;
++            let got = file.read_at_compat(&mut head, 0)?;
+             head.truncate(got);
+             match Gguf::parse(&head) {
+                 Ok(g) => return Ok(g),
+@@ -2488,7 +2524,7 @@ mod real {
+                 Ok(i) => i,
+                 Err(i) => i.saturating_sub(1),
+             };
+-            self.files[i].1.read_exact_at(buf, offset - self.files[i].0)
++            self.files[i].1.read_exact_at_compat(buf, offset - self.files[i].0)
+         }
+     }
+ 
+@@ -8053,5 +8089,5 @@ mod real {
+     }
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ pub use real::*;
+diff --git a/crates/kernels/build.rs b/crates/kernels/build.rs
+index c0c6bba..7930ffd 100644
+--- a/crates/kernels/build.rs
++++ b/crates/kernels/build.rs
+@@ -1,6 +1,7 @@
+ fn main() {
+-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+-        return; // kernels are CUDA/Linux; other hosts get an empty crate
++    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
++    if target_os != "linux" && target_os != "windows" {
++        return;
+     }
+     println!("cargo:rerun-if-changed=cuda");
+     // One fatbin for every NVIDIA generation the kernels can serve. The
+@@ -27,6 +28,9 @@ fn main() {
+         .unwrap_or_else(|_| default_archs());
+     let mut build = cc::Build::new();
+     build.cuda(true).flag("-O3").flag("--use_fast_math");
++    if target_os == "windows" {
++        build.flag("-Xcompiler=/utf-8");
++    }
+     // Per-thread default stream: <<<>>> launches go to the calling
+     // thread's stream instead of the legacy NULL stream, which makes
+     // them CAPTURABLE into CUDA graphs (the legacy stream cannot begin
+@@ -37,7 +41,7 @@ fn main() {
+     // nvcc rejects host compilers newer than its toolkit supports (e.g.
+     // CUDA 12.0 caps at gcc 12 while distro c++ is gcc 13). Probe a tiny
+     // compile with candidate ccbins and take the first one nvcc accepts.
+-    if let Some(ccbin) = pick_ccbin() {
++    if let Some(ccbin) = pick_ccbin(&target_os) {
+         build.flag(format!("-ccbin={ccbin}"));
+     }
+     let list: Vec<&str> = archs
+@@ -62,7 +66,13 @@ fn main() {
+         .file("cuda/pulsar_kernels.cu")
+         .compile("pulsar_kernels");
+     println!("cargo:rustc-link-lib=cudart");
+-    println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
++    if target_os == "windows" {
++        if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
++            println!("cargo:rustc-link-search=native={}\\lib\\x64", cuda_path);
++        }
++    } else {
++        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
++    }
+ }
+ 
+ fn default_archs() -> Vec<String> {
+@@ -91,11 +101,17 @@ fn default_archs() -> Vec<String> {
+     }
+ }
+ 
+-fn pick_ccbin() -> Option<String> {
++fn pick_ccbin(target_os: &str) -> Option<String> {
+     let mut candidates: Vec<String> = Vec::new();
+     if let Ok(env) = std::env::var("NVCC_CCBIN") {
+         return Some(env); // explicit override, no probe
+     }
++    if target_os == "windows" {
++        // `cc` discovers the Visual Studio toolchain and supplies cl.exe to
++        // nvcc.  An explicit NVCC_CCBIN still wins when a custom toolchain
++        // is required.
++        return None;
++    }
+     candidates.push("c++".into());
+     for v in ["14", "13", "12", "11", "10"] {
+         candidates.push(format!("g++-{v}"));
+diff --git a/crates/kernels/cuda/pulsar_kernels.cu b/crates/kernels/cuda/pulsar_kernels.cu
+index 94ff825..a736d04 100644
+--- a/crates/kernels/cuda/pulsar_kernels.cu
++++ b/crates/kernels/cuda/pulsar_kernels.cu
+@@ -17,6 +17,10 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
+ typedef struct ds4_gpu_tensor {
+     void *ptr;
+     uint64_t bytes;
+diff --git a/crates/kernels/src/lib.rs b/crates/kernels/src/lib.rs
+index 484366e..70d1bc8 100644
+--- a/crates/kernels/src/lib.rs
++++ b/crates/kernels/src/lib.rs
+@@ -1,7 +1,7 @@
+ //! FFI to the pulsar CUDA kernel library. Linux + NVIDIA only; on other
+ //! hosts the crate compiles to nothing so the workspace still builds.
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ mod real {
+     use std::ffi::c_void;
+ 
+@@ -1404,11 +1404,11 @@ mod real {
+     }
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ pub use real::*;
+ 
+ #[cfg(test)]
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ mod tests {
+     /// GPU-required; run explicitly: cargo test -p kernels -- --ignored
+     #[test]
+diff --git a/crates/stream/src/lib.rs b/crates/stream/src/lib.rs
+index 5da6917..2acede3 100644
+--- a/crates/stream/src/lib.rs
++++ b/crates/stream/src/lib.rs
+@@ -402,6 +402,250 @@ pub mod fetch {
+     }
+ }
+ 
++#[cfg(target_os = "windows")]
++pub mod uring {
++    //! Windows compatibility layer for the Linux `io_uring` API surface.
++    //! The deployment keeps hot and CPU-lane experts resident, so this
++    //! fallback prioritizes correctness and pinned H2D buffers over disk
++    //! queue depth.  The public types deliberately match the Linux module.
++
++    use super::Read;
++    use std::os::windows::fs::FileExt;
++
++    #[derive(Clone, Copy)]
++    pub struct BufAlloc {
++        pub alloc: fn(usize) -> *mut u8,
++        pub free: fn(*mut u8, usize),
++    }
++
++    pub struct Aligned {
++        ptr: *mut u8,
++        cap: usize,
++        align: usize,
++        custom_free: Option<fn(*mut u8, usize)>,
++    }
++
++    unsafe impl Send for Aligned {}
++
++    impl Aligned {
++        pub fn ptr(&self) -> *mut u8 {
++            self.ptr
++        }
++
++        pub fn cap(&self) -> usize {
++            self.cap
++        }
++
++        pub fn new(cap: usize, align: usize) -> Option<Self> {
++            let layout = std::alloc::Layout::from_size_align(cap, align).ok()?;
++            let ptr = unsafe { std::alloc::alloc(layout) };
++            if ptr.is_null() {
++                return None;
++            }
++            Some(Self { ptr, cap, align, custom_free: None })
++        }
++
++        pub fn new_with(cap: usize, align: usize, a: Option<BufAlloc>) -> Option<Self> {
++            if let Some(a) = a {
++                let ptr = (a.alloc)(cap);
++                if !ptr.is_null() {
++                    return Some(Self {
++                        ptr,
++                        cap,
++                        align,
++                        custom_free: Some(a.free),
++                    });
++                }
++            }
++            Self::new(cap, align)
++        }
++    }
++
++    impl Drop for Aligned {
++        fn drop(&mut self) {
++            match self.custom_free {
++                Some(free) => free(self.ptr, self.cap),
++                None => {
++                    let layout = std::alloc::Layout::from_size_align(self.cap, self.align).unwrap();
++                    unsafe { std::alloc::dealloc(self.ptr, layout) }
++                }
++            }
++        }
++    }
++
++    pub struct Stats {
++        pub bytes_payload: u64,
++        pub bytes_disk: u64,
++        pub reads: u64,
++        pub secs: f64,
++        pub checksum: u8,
++    }
++
++    fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
++        while !buf.is_empty() {
++            let read = file.seek_read(buf, offset)?;
++            if read == 0 {
++                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
++            }
++            offset += read as u64;
++            buf = &mut buf[read..];
++        }
++        Ok(())
++    }
++
++    pub fn run_plan(
++        file: &std::fs::File,
++        reads: &[Read],
++        _qd: usize,
++        align: u64,
++    ) -> std::io::Result<Stats> {
++        let started = std::time::Instant::now();
++        let mut stats = Stats {
++            bytes_payload: 0,
++            bytes_disk: 0,
++            reads: 0,
++            secs: 0.0,
++            checksum: 0,
++        };
++        for read in reads {
++            let aligned_off = read.offset & !(align - 1);
++            let payload_off = (read.offset - aligned_off) as usize;
++            let disk_len = (payload_off as u64 + read.len).div_ceil(align) * align;
++            let buffer = Aligned::new(disk_len as usize + 256, align as usize)
++                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
++            let target = unsafe { std::slice::from_raw_parts_mut(buffer.ptr, disk_len as usize) };
++            read_exact_at(file, target, aligned_off)?;
++            stats.bytes_payload += read.len;
++            stats.bytes_disk += disk_len;
++            stats.reads += 1;
++            stats.checksum ^= unsafe { *buffer.ptr.add(payload_off + read.len as usize / 2) };
++        }
++        stats.secs = started.elapsed().as_secs_f64();
++        Ok(stats)
++    }
++}
++
++#[cfg(target_os = "windows")]
++pub mod fetch {
++    //! Synchronous Windows fetcher with the same owned-slab contract as
++    //! the Linux `io_uring` implementation.  Expert buffers can still be
++    //! CUDA-pinned through `BufAlloc`, preserving full-speed H2D copies.
++
++    use super::uring::Aligned;
++    use super::Read;
++    use std::os::windows::fs::FileExt;
++
++    const ALIGN: u64 = 4096;
++
++    pub struct Slab {
++        buf: Aligned,
++        payload_off: usize,
++        payload_len: usize,
++    }
++
++    impl Slab {
++        pub fn payload(&self) -> &[u8] {
++            unsafe {
++                std::slice::from_raw_parts(self.buf.ptr().add(self.payload_off), self.payload_len)
++            }
++        }
++
++        pub fn bytes(&self) -> usize {
++            self.buf.cap()
++        }
++    }
++
++    pub struct Fetcher {
++        files: Vec<(u64, std::fs::File)>,
++        _qd: usize,
++        buf_alloc: Option<super::uring::BufAlloc>,
++    }
++
++    impl Fetcher {
++        pub fn open(path: &std::path::Path, qd: usize) -> std::io::Result<Fetcher> {
++            Self::open_with(path, qd, None)
++        }
++
++        pub fn open_with(
++            path: &std::path::Path,
++            qd: usize,
++            buf_alloc: Option<super::uring::BufAlloc>,
++        ) -> std::io::Result<Fetcher> {
++            Self::open_split(std::slice::from_ref(&(0, path.to_path_buf())), qd, buf_alloc)
++        }
++
++        pub fn open_split(
++            shards: &[(u64, std::path::PathBuf)],
++            qd: usize,
++            buf_alloc: Option<super::uring::BufAlloc>,
++        ) -> std::io::Result<Fetcher> {
++            let mut files = Vec::with_capacity(shards.len());
++            for (base, path) in shards {
++                files.push((*base, std::fs::File::open(path)?));
++            }
++            Ok(Fetcher { files, _qd: qd, buf_alloc })
++        }
++
++        fn route(&self, offset: u64) -> (&std::fs::File, u64) {
++            let index = match self.files.binary_search_by(|(base, _)| base.cmp(&offset)) {
++                Ok(index) => index,
++                Err(index) => index.saturating_sub(1),
++            };
++            (&self.files[index].1, offset - self.files[index].0)
++        }
++
++        fn read_exact_at(
++            file: &std::fs::File,
++            mut buf: &mut [u8],
++            mut offset: u64,
++        ) -> std::io::Result<()> {
++            while !buf.is_empty() {
++                let read = file.seek_read(buf, offset)?;
++                if read == 0 {
++                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
++                }
++                offset += read as u64;
++                buf = &mut buf[read..];
++            }
++            Ok(())
++        }
++
++        pub fn fetch(&mut self, reads: &[Read]) -> std::io::Result<Vec<Slab>> {
++            let mut output = Vec::with_capacity(reads.len());
++            self.fetch_each(reads, |_, slab| {
++                output.push(slab);
++                Ok(())
++            })?;
++            Ok(output)
++        }
++
++        pub fn fetch_each(
++            &mut self,
++            reads: &[Read],
++            mut on_slab: impl FnMut(usize, Slab) -> std::io::Result<()>,
++        ) -> std::io::Result<()> {
++            for (index, read) in reads.iter().enumerate() {
++                let (file, local) = self.route(read.offset);
++                let aligned_off = local & !(ALIGN - 1);
++                let payload_off = (local - aligned_off) as usize;
++                let disk_len = (payload_off as u64 + read.len).next_multiple_of(ALIGN);
++                let buffer = Aligned::new_with(
++                    disk_len as usize + 256,
++                    ALIGN as usize,
++                    self.buf_alloc,
++                )
++                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
++                let target = unsafe {
++                    std::slice::from_raw_parts_mut(buffer.ptr(), disk_len as usize)
++                };
++                Self::read_exact_at(file, target, aligned_off)?;
++                on_slab(index, Slab { buf: buffer, payload_off, payload_len: read.len as usize })?;
++            }
++            Ok(())
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -414,4 +658,24 @@ mod tests {
+         ];
+         assert_eq!(plan_from_str(&plan_to_string(&reads)).unwrap(), reads);
+     }
++
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn windows_fetcher_preserves_unaligned_payloads() {
++        let temp_dir = std::env::current_dir().unwrap().join(".test-tmp");
++        std::fs::create_dir_all(&temp_dir).unwrap();
++        let path = temp_dir.join(format!("stream-{}.bin", std::process::id()));
++        let bytes = (0..12_288).map(|index| (index % 251) as u8).collect::<Vec<_>>();
++        std::fs::write(&path, &bytes).unwrap();
++
++        let reads = [Read { offset: 137, len: 1_003 }, Read { offset: 5_017, len: 733 }];
++        let mut fetcher = fetch::Fetcher::open(&path, 4).unwrap();
++        let slabs = fetcher.fetch(&reads).unwrap();
++
++        assert_eq!(slabs[0].payload(), &bytes[137..1_140]);
++        assert_eq!(slabs[1].payload(), &bytes[5_017..5_750]);
++        drop(fetcher);
++        std::fs::remove_file(path).unwrap();
++        let _ = std::fs::remove_dir(temp_dir);
++    }
+ }
+-- 
+2.50.1.windows.1
+

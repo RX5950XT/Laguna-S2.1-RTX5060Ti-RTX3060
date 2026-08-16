@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RX5950XT <123271969+RX5950XT@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 12:51:50 +0800
+Subject: [PATCH 4/6] fix: rebuild CUDA kernels when arch changes
+
+
+diff --git a/crates/kernels/build.rs b/crates/kernels/build.rs
+index 7930ffd..0a7f494 100644
+--- a/crates/kernels/build.rs
++++ b/crates/kernels/build.rs
+@@ -4,6 +4,7 @@ fn main() {
+         return;
+     }
+     println!("cargo:rerun-if-changed=cuda");
++    println!("cargo:rerun-if-env-changed=PULSAR_CUDA_ARCH");
+     // One fatbin for every NVIDIA generation the kernels can serve. The
+     // floor is dp4a = sm_61 (Pascal / GTX 10-series); nothing newer is
+     // required (no tensor cores, no async-copy, static <=48KB shared).
+-- 
+2.50.1.windows.1
+

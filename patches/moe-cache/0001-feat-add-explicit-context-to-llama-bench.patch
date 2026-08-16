@@ -1,0 +1,179 @@
+From 1111111111111111111111111111111111111111 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Thu, 13 Aug 2026 14:30:00 +0800
+Subject: [PATCH] feat: add explicit context to llama-bench
+
+---
+ tools/llama-bench/llama-bench.cpp | 41 ++++++++++++++++++++++++++++---
+ 1 file changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index 2b5a441f..58a261a2 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -409,6 +409,7 @@ struct cmd_params {
+     int                              n_gen_warmup;
+     std::vector<std::pair<int, int>> n_pg;
+     std::vector<int>                 n_depth;
++    std::vector<int>                 n_ctx;
+     std::vector<int>                 n_batch;
+     std::vector<int>                 n_ubatch;
+     std::vector<ggml_type>           type_k;
+@@ -459,6 +460,7 @@ static const cmd_params cmd_params_defaults = {
+     /* n_gen_warmup         */ 1,
+     /* n_pg                 */ {},
+     /* n_depth              */ { 0 },
++    /* n_ctx                */ { 0 },
+     /* n_batch              */ { 2048 },
+     /* n_ubatch             */ { 512 },
+     /* type_k               */ { GGML_TYPE_F16 },
+@@ -536,6 +538,7 @@ static void print_usage(int /* argc */, char ** argv) {
+     printf("  -n, --n-gen <n>                                   (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
+     printf("  -pg <pp,tg>                                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
+     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
++    printf("  -c, --ctx-size <n>                                (default: derived from test size)\n");
+     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
+     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
+@@ -710,6 +713,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+                 }
+                 auto p = parse_int_range(argv[i]);
+                 params.n_depth.insert(params.n_depth.end(), p.begin(), p.end());
++            } else if (arg == "-c" || arg == "--ctx-size") {
++                if (++i >= argc) {
++                    invalid_param = true;
++                    break;
++                }
++                auto p = parse_int_range(argv[i]);
++                if (std::any_of(p.begin(), p.end(), [](int value) { return value <= 0; })) {
++                    invalid_param = true;
++                    break;
++                }
++                params.n_ctx.insert(params.n_ctx.end(), p.begin(), p.end());
+             } else if (arg == "-b" || arg == "--batch-size") {
+                 if (++i >= argc) {
+                     invalid_param = true;
+@@ -1244,6 +1258,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+     if (params.n_depth.empty()) {
+         params.n_depth = cmd_params_defaults.n_depth;
+     }
++    if (params.n_ctx.empty()) {
++        params.n_ctx = cmd_params_defaults.n_ctx;
++    }
+     if (params.n_batch.empty()) {
+         params.n_batch = cmd_params_defaults.n_batch;
+     }
+@@ -1342,6 +1359,7 @@ struct cmd_params_instance {
+     int                n_gen;
+     int                n_gen_warmup;
+     int                n_depth;
++    int                n_ctx;
+     int                n_batch;
+     int                n_ubatch;
+     ggml_type          type_k;
+@@ -1433,7 +1451,8 @@ struct cmd_params_instance {
+     llama_context_params to_llama_cparams() const {
+         llama_context_params cparams = llama_context_default_params();
+ 
+-        cparams.n_ctx           = n_prompt + std::max(n_gen + n_depth, n_gen_warmup);
++        const int n_ctx_required = n_prompt + std::max(n_gen + n_depth, n_gen_warmup);
++        cparams.n_ctx           = std::max(n_ctx, n_ctx_required);
+         cparams.n_batch         = n_batch;
+         cparams.n_ubatch        = n_ubatch;
+         cparams.type_k          = type_k;
+@@ -1478,6 +1497,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+     for (const auto & cm : params.cpu_mask)
+     for (const auto & cs : params.cpu_strict)
+     for (const auto & nd : params.n_depth)
++    for (const auto & nc : params.n_ctx)
+     for (const auto & pl : params.poll) {
+         for (const auto & n_prompt : params.n_prompt) {
+             if (n_prompt == 0) {
+@@ -1489,6 +1509,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .n_gen                 = */ 0,
+                 /* .n_gen_warmup          = */ 0,
+                 /* .n_depth               = */ nd,
++                /* .n_ctx                 = */ nc,
+                 /* .n_batch               = */ nb,
+                 /* .n_ubatch              = */ nub,
+                 /* .type_k                = */ tk,
+@@ -1528,6 +1549,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .n_gen                 = */ n_gen,
+                 /* .n_gen_warmup          = */ params.n_gen_warmup,
+                 /* .n_depth               = */ nd,
++                /* .n_ctx                 = */ nc,
+                 /* .n_batch               = */ nb,
+                 /* .n_ubatch              = */ nub,
+                 /* .type_k                = */ tk,
+@@ -1567,6 +1589,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
+                 /* .n_gen                 = */ n_pg.second,
+                 /* .n_gen_warmup          = */ n_pg.second > 0 ? params.n_gen_warmup : 0,
+                 /* .n_depth               = */ nd,
++                /* .n_ctx                 = */ nc,
+                 /* .n_batch               = */ nb,
+                 /* .n_ubatch              = */ nub,
+                 /* .type_k                = */ tk,
+@@ -1612,6 +1635,7 @@ struct test {
+     uint64_t                 model_n_params;
+     int                      n_batch;
+     int                      n_ubatch;
++    uint32_t                 n_ctx;
+     int                      n_threads;
+     std::string              cpu_mask;
+     bool                     cpu_strict;
+@@ -1656,6 +1680,7 @@ struct test {
+         model_n_params = llama_model_n_params(lmodel);
+         n_batch        = inst.n_batch;
+         n_ubatch       = inst.n_ubatch;
++        n_ctx          = llama_n_ctx(ctx);
+         n_threads      = inst.n_threads;
+         cpu_mask       = inst.cpu_mask;
+         cpu_strict     = inst.cpu_strict;
+@@ -1747,7 +1772,7 @@ struct test {
+         static const std::vector<std::string> fields = {
+             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
+             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
+-            "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
++            "n_ubatch",       "n_ctx",          "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
+             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "moe_cache",
+             "moe_cache_fit",  "repack",         "split_mode",
+             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+@@ -1762,7 +1787,7 @@ struct test {
+     enum field_type { STRING, BOOL, INT, FLOAT };
+ 
+     static field_type get_field_type(const std::string & field) {
+-        if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
++        if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_ctx" || field == "n_threads" ||
+             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
+             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_gen_warmup" ||
+             field == "n_depth" || field == "avg_ns" ||
+@@ -1831,6 +1856,7 @@ struct test {
+                                             std::to_string(model_n_params),
+                                             std::to_string(n_batch),
+                                             std::to_string(n_ubatch),
++                                            std::to_string(n_ctx),
+                                             std::to_string(n_threads),
+                                             cpu_mask,
+                                             std::to_string(cpu_strict),
+@@ -2036,6 +2062,9 @@ struct markdown_printer : public printer {
+         if (field == "n_ubatch") {
+             return 8;
+         }
++        if (field == "n_ctx") {
++            return 8;
++        }
+         if (field == "type_k" || field == "type_v") {
+             return 6;
+         }
+@@ -2178,6 +2207,9 @@ struct markdown_printer : public printer {
+         if (params.n_ubatch.size() > 1 || params.n_ubatch != cmd_params_defaults.n_ubatch) {
+             fields.emplace_back("n_ubatch");
+         }
++        if (params.n_ctx.size() > 1 || params.n_ctx != cmd_params_defaults.n_ctx) {
++            fields.emplace_back("n_ctx");
++        }
+         if (params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {
+             fields.emplace_back("type_k");
+         }
+-- 
+2.50.1.windows.1

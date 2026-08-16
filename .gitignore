@@ -1,0 +1,36 @@
+# 大型模型與專案內快取
+models/
+.cache/
+tmp/
+logs/
+benchmarks/results/
+benchmarks/moe-*/
+build/
+.audit-build/
+
+# 第三方原始碼由 bootstrap 腳本依固定 revision 取得
+third_party/
+
+# Python / IDE / 測試快取
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+
+# 敏感資訊與環境檔
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.token
+
+# 執行期與系統暫存狀態
+*.pid
+*.log
+.DS_Store
+Thumbs.db

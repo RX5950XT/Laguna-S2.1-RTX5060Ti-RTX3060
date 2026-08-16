@@ -1,0 +1,56 @@
+{
+  "captured_at": "2026-08-13T11:04:59.0760344+08:00",
+  "project_root": "D:\\Workspace\\AI_inference\\Laguna-S2.1-RTX5060Ti-RTX3060",
+  "constraints": {
+    "memory_speed_mts": 2133,
+    "memory_speed_is_stability_limit": true,
+    "context_tokens": 262144,
+    "minimum_decode_tps": 20.0,
+    "maximum_quality_loss_exclusive": 0.05
+  },
+  "cpu": {
+    "name": "AMD Ryzen 7 5700X 8-Core Processor             ",
+    "cores": 8,
+    "logical_processors": 16
+  },
+  "ram": {
+    "total_bytes": 102999724032,
+    "configured_speed_mts": [
+      2133,
+      2133,
+      2133,
+      2133
+    ]
+  },
+  "gpus": [
+    {
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 5060 Ti",
+      "memory_total_mib": 16311,
+      "memory_free_mib": 13945,
+      "compute_capability": "12.0",
+      "pcie_generation_current": 4,
+      "pcie_generation_max": 4,
+      "pcie_width_current": 8,
+      "pcie_width_max": 16,
+      "power_limit_watts": 171.0
+    },
+    {
+      "index": 1,
+      "name": "NVIDIA GeForce RTX 3060",
+      "memory_total_mib": 12288,
+      "memory_free_mib": 12115,
+      "compute_capability": "8.6",
+      "pcie_generation_current": 1,
+      "pcie_generation_max": 4,
+      "pcie_width_current": 8,
+      "pcie_width_max": 16,
+      "power_limit_watts": 170.0
+    }
+  ],
+  "storage": {
+    "drive": "D:",
+    "total_bytes": 2048390066176,
+    "free_bytes": 1257200713728
+  }
+}

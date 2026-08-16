@@ -1,0 +1,311 @@
+From 0d4d33448c163c1d17a2824e00c5bca722a9cba3 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Fri, 14 Aug 2026 14:02:00 +0800
+Subject: [PATCH] feat: capture fused-down MoE compute into a CUDA graph
+
+---
+ ggml/src/ggml-cuda/moe-cache.cu | 162 ++++++++++++++++++++++++++------
+ tests/test-moe-cache.cpp        |  52 +++++-----
+ 2 files changed, 163 insertions(+), 51 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-cache.cu b/ggml/src/ggml-cuda/moe-cache.cu
+index 73e52179..0f81b8a4 100644
+--- a/ggml/src/ggml-cuda/moe-cache.cu
++++ b/ggml/src/ggml-cuda/moe-cache.cu
+@@ -216,6 +216,24 @@ struct moe_cache_device {
+     float * h_out = nullptr;
+     size_t h_out_cap = 0;
+ 
++    cudaGraph_t compute_graph = nullptr;
++    cudaGraphExec_t compute_graph_exec = nullptr;
++    int graph_n_hits = -1;
++    int64_t graph_n_in = -1;
++    int64_t graph_n_out = -1;
++    int64_t graph_mid_out = -1;
++    bool graph_fused = false;
++    bool graph_fused_down = false;
++    bool graph_act_map = false;
++    const void * graph_d_input = nullptr;
++    const void * graph_d_q8 = nullptr;
++    const void * graph_d_out = nullptr;
++    const void * graph_up_slab = nullptr;
++    const void * graph_gate_slab = nullptr;
++    const void * graph_down_slab = nullptr;
++    long long graph_replays = 0;
++    long long graph_captures = 0;
++
+     // hits and misses count tensor-expert probes; fusion counters count row pairs.
+     long long hits = 0;
+     long long misses = 0;
+@@ -1517,7 +1535,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
+         used += pool.n_slots - pool.free_slots.size();
+     }
+     const long long total = device.hits + device.misses;
+-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld collect-wait-us=%lld dispatch-us=%lld download-prefetch=%lld\n",
++    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld collect-wait-us=%lld dispatch-us=%lld download-prefetch=%lld graph-captures=%lld graph-replays=%lld\n",
+             device.physical, device.hits, total,
+             total ? 100.0 * (double)device.hits / (double)total : 0.0,
+             used, slots, device.inserts, device.fills, device.fill_failures,
+@@ -1532,7 +1550,9 @@ static void moe_cache_log_stats(moe_cache_device & device) {
+             device.fused_nodes,
+             device.collect_wait_ns / 1000,
+             device.dispatch_ns / 1000,
+-            device.download_prefetch);
++            device.download_prefetch,
++            device.graph_captures,
++            device.graph_replays);
+ }
+ 
+ static void moe_cache_log_configuration(moe_cache_session & session) {
+@@ -1745,6 +1765,14 @@ static void moe_cache_free_device(moe_cache_device & device) {
+         cudaFreeHost(device.h_out);
+         device.h_out = nullptr;
+     }
++    if (device.compute_graph_exec) {
++        cudaGraphExecDestroy(device.compute_graph_exec);
++        device.compute_graph_exec = nullptr;
++    }
++    if (device.compute_graph) {
++        cudaGraphDestroy(device.compute_graph);
++        device.compute_graph = nullptr;
++    }
+     if (device.compute_stream) {
+         cudaStreamDestroy(device.compute_stream);
+         device.compute_stream = nullptr;
+@@ -2539,6 +2567,18 @@ static int moe_cache_plan(
+     return hits;
+ }
+ 
++static void moe_cache_graph_reset(moe_cache_device & device) {
++    if (device.compute_graph_exec) {
++        cudaGraphExecDestroy(device.compute_graph_exec);
++        device.compute_graph_exec = nullptr;
++    }
++    if (device.compute_graph) {
++        cudaGraphDestroy(device.compute_graph);
++        device.compute_graph = nullptr;
++    }
++    device.graph_n_hits = -1;
++}
++
+ static bool moe_cache_enqueue_output_download(
+         moe_cache_device & device, int n_hits, int64_t n_out) {
+     const size_t bytes = (size_t)n_hits * (size_t)n_out * sizeof(float);
+@@ -2774,21 +2814,19 @@ static int moe_cache_dispatch_internal(
+         moe_cache_cuda_ok(device, cudaMemcpyAsync(
+                 device.d_input, device.h_input, input_bytes,
+                 cudaMemcpyHostToDevice, device.compute_stream), "input upload", true);
+-    if (ok) {
+-        quantize_row_q8_1_cuda(
+-                d_act, nullptr, device.d_act_q8, (ggml_type)wtype,
+-                n_in, n_in, (int64_t)activation_rows * n_in,
+-                (int64_t)activation_rows * n_in, padded_n_in,
+-                activation_rows, 1, 1, device.compute_stream);
+-        ok = moe_cache_cuda_ok(
+-                device, cudaPeekAtLastError(), "activation quantization", true);
+-    }
+     const int32_t * d_act_ids = use_activation_map
+         ? d_ids + (1 + (fused ? 1 : 0) + (fused_down ? 1 : 0)) * n_hits
+         : nullptr;
+     const int32_t * d_down_ids = fused_down
+         ? d_ids + (1 + (fused ? 1 : 0)) * n_hits : nullptr;
+-    if (ok) {
++    const void * gate_slab = fused && gate_pool ? gate_pool->slab : nullptr;
++    const void * down_slab = fused_down && down_pool ? down_pool->slab : nullptr;
++    auto launch_compute = [&]() {
++        quantize_row_q8_1_cuda(
++                d_act, nullptr, device.d_act_q8, (ggml_type)wtype,
++                n_in, n_in, (int64_t)activation_rows * n_in,
++                (int64_t)activation_rows * n_in, padded_n_in,
++                activation_rows, 1, 1, device.compute_stream);
+         if (fused) {
+             ggml_cuda_moe_cache_mmv_fused(
+                     pool.slab, gate_pool->slab, (ggml_type)wtype,
+@@ -2806,30 +2844,96 @@ static int moe_cache_dispatch_internal(
+                     (int64_t)pool.expert_size, n_hits, activation_rows,
+                     device.compute_stream);
+         }
+-        ok = moe_cache_cuda_ok(
+-                device, cudaPeekAtLastError(), "expert matvec launch", true);
+-    }
+-    if (ok && fused_down) {
+-        quantize_row_q8_1_cuda(
+-                device.d_out, nullptr, device.d_act_q8, (ggml_type)wtype,
+-                mid_out, mid_out, (int64_t)n_hits * mid_out,
+-                (int64_t)n_hits * mid_out, padded_mid,
+-                n_hits, 1, 1, device.compute_stream);
+-        ok = moe_cache_cuda_ok(
+-                device, cudaPeekAtLastError(), "glu quantization", true);
+-        if (ok) {
++        if (fused_down) {
++            quantize_row_q8_1_cuda(
++                    device.d_out, nullptr, device.d_act_q8, (ggml_type)wtype,
++                    mid_out, mid_out, (int64_t)n_hits * mid_out,
++                    (int64_t)n_hits * mid_out, padded_mid,
++                    n_hits, 1, 1, device.compute_stream);
+             ggml_cuda_moe_cache_mmv(
+                     down_pool->slab, (ggml_type)wtype,
+                     (const char *)device.d_act_q8, d_down_ids, nullptr,
+                     device.d_out, mid_out, n_out, down_pool->n_slots,
+                     (int64_t)down_pool->expert_size, n_hits, n_hits,
+                     device.compute_stream);
+-            ok = moe_cache_cuda_ok(
+-                    device, cudaPeekAtLastError(), "down expert matvec launch", true);
+         }
+-    }
+-    if (ok) {
+-        ok = moe_cache_enqueue_output_download(device, n_hits, n_out);
++        return moe_cache_enqueue_output_download(device, n_hits, n_out);
++    };
++
++    const bool graph_match =
++        device.compute_graph_exec &&
++        device.graph_n_hits == n_hits &&
++        device.graph_n_in == n_in &&
++        device.graph_n_out == n_out &&
++        device.graph_mid_out == mid_out &&
++        device.graph_fused == fused &&
++        device.graph_fused_down == fused_down &&
++        device.graph_act_map == use_activation_map &&
++        device.graph_d_input == device.d_input &&
++        device.graph_d_q8 == device.d_act_q8 &&
++        device.graph_d_out == device.d_out &&
++        device.graph_up_slab == pool.slab &&
++        device.graph_gate_slab == gate_slab &&
++        device.graph_down_slab == down_slab;
++    if (ok && graph_match) {
++        ok = moe_cache_cuda_ok(
++                device, cudaGraphLaunch(device.compute_graph_exec, device.compute_stream),
++                "compute graph launch", true);
++        if (ok) {
++            device.graph_replays++;
++        }
++    } else if (ok) {
++        moe_cache_graph_reset(device);
++        const cudaError_t captured = cudaStreamBeginCapture(
++                device.compute_stream, cudaStreamCaptureModeThreadLocal);
++        if (captured == cudaSuccess) {
++            launch_compute();
++            cudaGraph_t graph = nullptr;
++            if (moe_cache_cuda_ok(
++                        device, cudaStreamEndCapture(device.compute_stream, &graph),
++                        "compute graph capture", false) && graph) {
++                cudaGraphExec_t exec = nullptr;
++                if (moe_cache_cuda_ok(
++                            device,
++                            cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
++                            "compute graph instantiate", false) && exec) {
++                    device.compute_graph = graph;
++                    device.compute_graph_exec = exec;
++                    device.graph_n_hits = n_hits;
++                    device.graph_n_in = n_in;
++                    device.graph_n_out = n_out;
++                    device.graph_mid_out = mid_out;
++                    device.graph_fused = fused;
++                    device.graph_fused_down = fused_down;
++                    device.graph_act_map = use_activation_map;
++                    device.graph_d_input = device.d_input;
++                    device.graph_d_q8 = device.d_act_q8;
++                    device.graph_d_out = device.d_out;
++                    device.graph_up_slab = pool.slab;
++                    device.graph_gate_slab = gate_slab;
++                    device.graph_down_slab = down_slab;
++                    device.graph_captures++;
++                    ok = moe_cache_cuda_ok(
++                            device, cudaGraphLaunch(exec, device.compute_stream),
++                            "compute graph launch", true);
++                } else {
++                    if (exec) {
++                        cudaGraphExecDestroy(exec);
++                    }
++                    cudaGraphDestroy(graph);
++                    ok = launch_compute();
++                }
++            } else {
++                if (graph) {
++                    cudaGraphDestroy(graph);
++                }
++                (void)cudaGetLastError();
++                ok = launch_compute();
++            }
++        } else {
++            (void)cudaGetLastError();
++            ok = launch_compute();
++        }
+     }
+ 
+     if (!ok) {
+diff --git a/tests/test-moe-cache.cpp b/tests/test-moe-cache.cpp
+index e85f3d0b..8885f409 100644
+--- a/tests/test-moe-cache.cpp
++++ b/tests/test-moe-cache.cpp
+@@ -3013,36 +3013,44 @@ static bool run_fused_down_collect(
+ 
+     bool ok = false;
+     if (ready) {
+-        uint64_t hit_mask = 0;
+-        void * node = ggml_moe_cache.fused_begin_ex(
+-                &up_desc, &gate_desc, &down_desc, GGML_GLU_OP_SWIGLU,
+-                -std::numeric_limits<float>::infinity(),
+-                std::numeric_limits<float>::infinity(),
+-                -std::numeric_limits<float>::infinity(),
+-                std::numeric_limits<float>::infinity(),
+-                &expert0, 1, 1, act_rows, &hit_mask);
+-        if (node && hit_mask == UINT64_C(1)) {
+-            std::vector<float> actual(n_in, 0.0f);
+-            float * rows[1] = { actual.data() };
+-            ok = ggml_moe_cache.collect(node, 1, rows, n_in) == 1;
+-            if (ok) {
+-                bool finite = true;
+-                bool nonzero = false;
+-                for (float value : actual) {
+-                    finite = finite && std::isfinite(value);
+-                    nonzero = nonzero || value != 0.0f;
++        auto run_once = [&]() {
++            uint64_t hit_mask = 0;
++            void * node = ggml_moe_cache.fused_begin_ex(
++                    &up_desc, &gate_desc, &down_desc, GGML_GLU_OP_SWIGLU,
++                    -std::numeric_limits<float>::infinity(),
++                    std::numeric_limits<float>::infinity(),
++                    -std::numeric_limits<float>::infinity(),
++                    std::numeric_limits<float>::infinity(),
++                    &expert0, 1, 1, act_rows, &hit_mask);
++            if (!node || hit_mask != UINT64_C(1)) {
++                if (node) {
++                    ggml_moe_cache.end(node);
+                 }
+-                ok = finite && nonzero;
++                return false;
+             }
++            std::vector<float> actual(n_in, 0.0f);
++            float * rows[1] = { actual.data() };
++            const bool collected =
++                ggml_moe_cache.collect(node, 1, rows, n_in) == 1;
+             ggml_moe_cache.end(node);
+-        } else if (node) {
+-            ggml_moe_cache.end(node);
+-        }
++            if (!collected) {
++                return false;
++            }
++            bool finite = true;
++            bool nonzero = false;
++            for (float value : actual) {
++                finite = finite && std::isfinite(value);
++                nonzero = nonzero || value != 0.0f;
++            }
++            return finite && nonzero;
++        };
++        ok = run_once() && run_once();
+     }
+     ggml_moe_cache.session_leave(session);
+     ggml_moe_cache.session_destroy(session);
+     ggml_backend_buffer_free(buffer);
+     ggml_free(ctx);
++    ok = ok && has_positive_field(capture.get(), "graph-replays=");
+ 
+     printf("cache-fused-down: %s\n", ok ? "OK" : "FAIL");
+     return ok;
+-- 
+2.50.1.windows.1
+

@@ -1,0 +1,1346 @@
+From d439a4e89cd49421827dabecd67cb1d6723f3cea Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Fri, 14 Aug 2026 13:53:10 +0800
+Subject: [PATCH] feat: overlap MoE collect and fuse down MMV on the same
+ stream
+
+---
+ ggml/src/ggml-backend-moe-cache.h |  11 +
+ ggml/src/ggml-cpu/ggml-cpu.c      |  73 +++++-
+ ggml/src/ggml-cuda/moe-cache.cu   | 388 +++++++++++++++++++++++++-----
+ tests/test-moe-cache.cpp          | 263 ++++++++++++++++++++
+ tools/llama-bench/CMakeLists.txt  |   5 +
+ tools/llama-bench/llama-bench.cpp |  45 +++-
+ 6 files changed, 713 insertions(+), 72 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-moe-cache.h b/ggml/src/ggml-backend-moe-cache.h
+index cf37588d..40edbb93 100644
+--- a/ggml/src/ggml-backend-moe-cache.h
++++ b/ggml/src/ggml-backend-moe-cache.h
+@@ -95,6 +95,17 @@ struct ggml_moe_cache_api {
+                           const int32_t * ids, int n_rows, int64_t n_tokens,
+                           const float * const * act_rows, uint64_t * hit_mask);
+ 
++    // Same as fused_begin, then immediately MMV `down` from the on-device GLU output.
++    // down may be NULL. Hits require up, gate, and down to be resident on the same lane.
++    // collect writes down->n_out rows instead of the GLU width.
++    void * (*fused_begin_ex)(const struct ggml_moe_cache_tensor_desc * up,
++                             const struct ggml_moe_cache_tensor_desc * gate,
++                             const struct ggml_moe_cache_tensor_desc * down,
++                             int glu_op, float up_min, float up_max,
++                             float gate_min, float gate_max,
++                             const int32_t * ids, int n_rows, int64_t n_tokens,
++                             const float * const * act_rows, uint64_t * hit_mask);
++
+     // Host buffer mutation or teardown notification. Sessions cancel or finish any fill that still reads the supplied range before this call returns.
+     void (*invalidate)(const void * base, size_t size);
+ };
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 27f58a17..c37acde1 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1825,6 +1825,7 @@ struct moe_cache_fused_state {
+     uint64_t hit_mask;
+     int n_hits;
+     int collect_ok;
++    int fused_down;
+     int32_t ids[MOE_CACHE_MAX_TOPK];
+     const float * acts[MOE_CACHE_MAX_TOPK];
+     float * rows[MOE_CACHE_MAX_TOPK];
+@@ -3166,6 +3167,7 @@ struct ggml_moe_cache_fusion {
+     struct ggml_tensor * up;
+     struct ggml_tensor * gate;
+     struct ggml_tensor * glu;
++    struct ggml_tensor * down;
+     float up_min;
+     float up_max;
+     float gate_min;
+@@ -3294,6 +3296,25 @@ static bool ggml_moe_cache_can_fuse(
+         up_weight->ne[2] <= 0) {
+         return false;
+     }
++
++    const int glu_index = node_n + fusion->skipped;
++    if (glu_index + 1 < cgraph->n_nodes) {
++        struct ggml_tensor * candidate = cgraph->nodes[glu_index + 1];
++        if (candidate && candidate->op == GGML_OP_MUL_MAT_ID &&
++            candidate->src[0] && candidate->src[1] == fusion->glu &&
++            candidate->src[2] == ids &&
++            ggml_moe_cache_weight_is_eligible(candidate->src[0]) &&
++            candidate->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous_1(candidate) &&
++            candidate->src[0]->ne[0] == fusion->glu->ne[0] &&
++            candidate->src[0]->ne[1] == up_weight->ne[0] &&
++            candidate->src[0]->ne[2] == up_weight->ne[2] &&
++            candidate->ne[0] == candidate->src[0]->ne[1] &&
++            candidate->ne[1] == ids->ne[0] &&
++            candidate->ne[2] == ids->ne[1]) {
++            fusion->down = candidate;
++        }
++    }
+     return true;
+ }
+ 
+@@ -3394,17 +3415,39 @@ static int ggml_cpu_try_fuse_moe_cache(
+                 state->acts[row] = (const float *)((const char *)acts->data + token*acts->nb[2] + (id % acts->ne[1])*acts->nb[1]);
+             }
+         }
+-        state->node = ggml_moe_cache.fused_begin(
+-                &up_desc, &gate_desc, (int)GGML_GLU_OP_SWIGLU,
+-                fusion.up_min, fusion.up_max,
+-                fusion.gate_min, fusion.gate_max,
+-                state->ids, n_rows, n_tokens,
+-                state->acts, &state->hit_mask);
++        if (fusion.down && ggml_moe_cache.fused_begin_ex) {
++            struct ggml_moe_cache_tensor_desc down_desc = {
++                fusion.down->src[0]->name,
++                fusion.down->src[0]->data,
++                fusion.down->src[0]->nb[2],
++                fusion.down->src[0]->ne[0],
++                fusion.down->src[0]->ne[1],
++                fusion.down->src[0]->ne[2],
++                (int32_t)fusion.down->src[0]->type,
++            };
++            state->node = ggml_moe_cache.fused_begin_ex(
++                    &up_desc, &gate_desc, &down_desc,
++                    (int)GGML_GLU_OP_SWIGLU,
++                    fusion.up_min, fusion.up_max,
++                    fusion.gate_min, fusion.gate_max,
++                    state->ids, n_rows, n_tokens,
++                    state->acts, &state->hit_mask);
++            state->fused_down = state->node != NULL;
++        }
++        if (!state->node) {
++            state->node = ggml_moe_cache.fused_begin(
++                    &up_desc, &gate_desc, (int)GGML_GLU_OP_SWIGLU,
++                    fusion.up_min, fusion.up_max,
++                    fusion.gate_min, fusion.gate_max,
++                    state->ids, n_rows, n_tokens,
++                    state->acts, &state->hit_mask);
++        }
+         if (state->node) {
++            struct ggml_tensor * dst = state->fused_down ? fusion.down : glu;
+             for (int row = 0; row < n_rows; row++) {
+                 if (state->hit_mask & (UINT64_C(1) << row)) {
+                     state->rows[state->n_hits++] =
+-                        (float *)((char *)glu->data + row*glu->nb[1]);
++                        (float *)((char *)dst->data + row*dst->nb[1]);
+                 }
+             }
+         }
+@@ -3435,9 +3478,16 @@ static int ggml_cpu_try_fuse_moe_cache(
+             params, gate, up, glu, miss_mask, true,
+             fusion.clamped, fusion.up_min, fusion.up_max,
+             fusion.gate_min, fusion.gate_max);
++    if (state->fused_down && fusion.down) {
++        ggml_barrier(params->threadpool);
++        ggml_compute_forward_mul_mat_id_impl(
++                &sub_params, fusion.down, miss_mask, true, false);
++    }
+     if (params->ith == 0) {
++        const int64_t collect_n_out = state->fused_down && fusion.down
++            ? fusion.down->ne[0] : glu->ne[0];
+         state->collect_ok = ggml_moe_cache.collect(
+-                state->node, state->n_hits, state->rows, glu->ne[0]);
++                state->node, state->n_hits, state->rows, collect_n_out);
+         ggml_moe_cache.end(state->node);
+         state->node = NULL;
+     }
+@@ -3454,9 +3504,14 @@ static int ggml_cpu_try_fuse_moe_cache(
+                 params, gate, up, glu, state->hit_mask, false,
+                 fusion.clamped, fusion.up_min, fusion.up_max,
+                 fusion.gate_min, fusion.gate_max);
++        if (state->fused_down && fusion.down) {
++            ggml_barrier(params->threadpool);
++            ggml_compute_forward_mul_mat_id_impl(
++                    &sub_params, fusion.down, state->hit_mask, true, false);
++        }
+     }
+ 
+-    return fusion.skipped;
++    return fusion.skipped + (state->fused_down ? 1 : 0);
+ }
+ 
+ static int ggml_cpu_try_fuse_ops(
+diff --git a/ggml/src/ggml-cuda/moe-cache.cu b/ggml/src/ggml-cuda/moe-cache.cu
+index 61429327..73e52179 100644
+--- a/ggml/src/ggml-cuda/moe-cache.cu
++++ b/ggml/src/ggml-cuda/moe-cache.cu
+@@ -23,6 +23,7 @@ void ggml_moe_cache_register(const void * owner) {
+ #include <algorithm>
+ #include <atomic>
+ #include <cerrno>
++#include <chrono>
+ #include <climits>
+ #include <cmath>
+ #include <condition_variable>
+@@ -238,6 +239,9 @@ struct moe_cache_device {
+     long long fused_nodes = 0;
+     long long nodes = 0;
+     long long collect_calls = 0;
++    long long collect_wait_ns = 0;
++    long long dispatch_ns = 0;
++    long long download_prefetch = 0;
+     std::atomic<int> error_logs{0};
+ };
+ 
+@@ -282,19 +286,23 @@ struct moe_cache_node {
+     int n_lanes = 0;
+     const void * host_base = nullptr;
+     const void * host_base2 = nullptr;
++    const void * host_base_down = nullptr;
+     size_t expert_size = 0;
+     int64_t n_in = 0;
+     int64_t n_out = 0;
++    int64_t n_mid = 0;
+     int64_t n_expert = 0;
++    moe_cache_pool * down_pools[moe_cache_max_lanes] = {};
+     int64_t n_tokens = 0;
+     int wtype = -1;
+     std::unique_lock<std::mutex> dispatch_lock;
+     std::unique_lock<std::mutex> dispatch_locks[moe_cache_max_lanes];
+-    moe_cache_pin pins[2 * moe_cache_node_rows_max];
++    moe_cache_pin pins[3 * moe_cache_node_rows_max];
+     int n_pins = 0;
+     int lane_dst[moe_cache_max_lanes][moe_cache_node_rows_max] = {};
+     int lane_n[moe_cache_max_lanes] = {};
+     bool lane_dispatched[moe_cache_max_lanes] = {};
++    bool lane_downloaded[moe_cache_max_lanes] = {};
+     bool planned = false;
+     bool dispatched = false;
+ };
+@@ -1509,7 +1517,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
+         used += pool.n_slots - pool.free_slots.size();
+     }
+     const long long total = device.hits + device.misses;
+-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld\n",
++    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld collect-wait-us=%lld dispatch-us=%lld download-prefetch=%lld\n",
+             device.physical, device.hits, total,
+             total ? 100.0 * (double)device.hits / (double)total : 0.0,
+             used, slots, device.inserts, device.fills, device.fill_failures,
+@@ -1521,7 +1529,10 @@ static void moe_cache_log_stats(moe_cache_device & device) {
+             device.pair_both, device.pair_up_only,
+             device.pair_gate_only, device.pair_neither,
+             device.fused_attempts,
+-            device.fused_nodes);
++            device.fused_nodes,
++            device.collect_wait_ns / 1000,
++            device.dispatch_ns / 1000,
++            device.download_prefetch);
+ }
+ 
+ static void moe_cache_log_configuration(moe_cache_session & session) {
+@@ -2528,6 +2539,31 @@ static int moe_cache_plan(
+     return hits;
+ }
+ 
++static bool moe_cache_enqueue_output_download(
++        moe_cache_device & device, int n_hits, int64_t n_out) {
++    const size_t bytes = (size_t)n_hits * (size_t)n_out * sizeof(float);
++    if (bytes == 0 || !device.h_out || !device.d_out ||
++        !device.compute_stream ||
++        bytes > device.h_out_cap || bytes > device.d_out_cap) {
++        return false;
++    }
++    return moe_cache_cuda_ok(
++            device,
++            cudaMemcpyAsync(
++                    device.h_out, device.d_out, bytes,
++                    cudaMemcpyDeviceToHost, device.compute_stream),
++            "output download", true);
++}
++
++static bool moe_cache_sync_compute(moe_cache_device & device) {
++    if (!device.compute_stream) {
++        return false;
++    }
++    return moe_cache_cuda_ok(
++            device, cudaStreamSynchronize(device.compute_stream),
++            "output synchronization", true);
++}
++
+ static int moe_cache_dispatch_internal(
+         void * opaque, int wtype, int64_t n_in, int64_t n_out, int n_hits,
+         const int32_t * slot_indices, const float * const * act_rows,
+@@ -2535,12 +2571,17 @@ static int moe_cache_dispatch_internal(
+         int glu_op, float up_min, float up_max,
+         float gate_min, float gate_max,
+         moe_cache_device * override_device = nullptr,
+-        moe_cache_pool * override_pool = nullptr) {
++        moe_cache_pool * override_pool = nullptr,
++        moe_cache_pool * down_pool = nullptr,
++        const int32_t * down_slot_indices = nullptr) {
+     moe_cache_node * node = (moe_cache_node *)opaque;
+     const bool fused = gate_pool != nullptr;
++    const bool fused_down = down_pool != nullptr;
++    const int64_t mid_out = fused_down && node->n_mid > 0 ? node->n_mid : n_out;
++    const int pins_per_hit = fused_down ? 3 : (fused ? 2 : 1);
+     if (!node || !node->planned || n_hits <= 0 ||
+         n_hits > moe_cache_node_rows_max ||
+-        n_hits * (fused ? 2 : 1) > node->n_pins ||
++        n_hits * pins_per_hit > node->n_pins ||
+         !slot_indices || !act_rows ||
+         (fused && (!gate_slot_indices ||
+                    gate_pool->wtype != wtype ||
+@@ -2549,8 +2590,11 @@ static int moe_cache_dispatch_internal(
+                    std::isnan(up_min) || std::isnan(up_max) ||
+                    std::isnan(gate_min) || std::isnan(gate_max) ||
+                    up_min > up_max || gate_min > gate_max)) ||
++        (fused_down && (!down_slot_indices ||
++                        down_pool->wtype != wtype ||
++                        mid_out <= 0 || n_out <= 0)) ||
+         wtype != node->wtype || n_in != node->n_in || n_out != node->n_out ||
+-        n_in > INT_MAX || n_out > INT_MAX ||
++        n_in > INT_MAX || n_out > INT_MAX || mid_out > INT_MAX ||
+         n_in > INT64_MAX - (MATRIX_ROW_PADDING - 1)) {
+         return 0;
+     }
+@@ -2558,18 +2602,26 @@ static int moe_cache_dispatch_internal(
+     moe_cache_session & session = *node->session;
+     moe_cache_device & device = override_device ? *override_device : *node->device;
+     moe_cache_pool & pool = override_pool ? *override_pool : *node->pool;
++    const auto dispatch_started = std::chrono::steady_clock::now();
+     int32_t local_slots[moe_cache_node_rows_max];
+     int32_t local_gate_slots[moe_cache_node_rows_max];
++    int32_t local_down_slots[moe_cache_node_rows_max];
+     for (int index = 0; index < n_hits; index++) {
+         local_slots[index] = moe_cache_unpack_slot(slot_indices[index]);
+         if (fused) {
+             local_gate_slots[index] = moe_cache_unpack_slot(gate_slot_indices[index]);
+         }
++        if (fused_down) {
++            local_down_slots[index] = moe_cache_unpack_slot(down_slot_indices[index]);
++        }
+     }
+     slot_indices = local_slots;
+     if (fused) {
+         gate_slot_indices = local_gate_slots;
+     }
++    if (fused_down) {
++        down_slot_indices = local_down_slots;
++    }
+     if (device.dead.load() || moe_cache_fail(session, "dispatch")) {
+         std::lock_guard<std::mutex> lock(session.mu);
+         device.dispatch_failures++;
+@@ -2595,6 +2647,8 @@ static int moe_cache_dispatch_internal(
+         if (slot_indices[index] < 0 || slot_indices[index] >= pool.n_slots ||
+             (fused && (gate_slot_indices[index] < 0 ||
+                        gate_slot_indices[index] >= gate_pool->n_slots)) ||
++            (fused_down && (down_slot_indices[index] < 0 ||
++                            down_slot_indices[index] >= down_pool->n_slots)) ||
+             !act_rows[index]) {
+             return 0;
+         }
+@@ -2634,7 +2688,7 @@ static int moe_cache_dispatch_internal(
+     }
+     const bool use_activation_map =
+         session.config.force_dedicated_mmv || !modulo_activation;
+-    const size_t id_arrays = 1 + (fused ? 1 : 0) +
++    const size_t id_arrays = 1 + (fused ? 1 : 0) + (fused_down ? 1 : 0) +
+         (use_activation_map ? 1 : 0);
+     const size_t ids_bytes = (size_t)n_hits * sizeof(int32_t) * id_arrays;
+     const size_t act_bytes = (size_t)activation_rows * n_in * sizeof(float);
+@@ -2642,14 +2696,21 @@ static int moe_cache_dispatch_internal(
+         return 0;
+     }
+     const size_t input_bytes = ids_bytes + act_bytes;
+-    const size_t q8_bytes =
++    const int64_t padded_mid =
++        ((mid_out + MATRIX_ROW_PADDING - 1) / MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
++    const size_t q8_act_bytes =
+         (size_t)activation_rows * (padded_n_in / QK8_1) * sizeof(block_q8_1);
+-    const size_t out_bytes = (size_t)n_hits * n_out * sizeof(float);
++    const size_t q8_mid_bytes = fused_down
++        ? (size_t)n_hits * (padded_mid / QK8_1) * sizeof(block_q8_1) : 0;
++    const size_t q8_bytes = q8_act_bytes > q8_mid_bytes ? q8_act_bytes : q8_mid_bytes;
++    const size_t mid_bytes = (size_t)n_hits * (size_t)mid_out * sizeof(float);
++    const size_t out_bytes = (size_t)n_hits * (size_t)n_out * sizeof(float);
++    const size_t device_out_bytes = mid_bytes > out_bytes ? mid_bytes : out_bytes;
+ 
+     const size_t desired_caps[] = {
+         moe_cache_growth_capacity(device.d_input_cap, input_bytes),
+         moe_cache_growth_capacity(device.act_q8_cap, q8_bytes),
+-        moe_cache_growth_capacity(device.d_out_cap, out_bytes),
++        moe_cache_growth_capacity(device.d_out_cap, device_out_bytes),
+     };
+     size_t scratch_bytes = 0;
+     for (size_t capacity : desired_caps) {
+@@ -2676,7 +2737,7 @@ static int moe_cache_dispatch_internal(
+         !moe_cache_grow_device(device, &device.d_act_q8, device.act_q8_cap,
+                                q8_bytes, "q8 activation allocation") ||
+         !moe_cache_grow_device(device, (void **)&device.d_out, device.d_out_cap,
+-                               out_bytes, "output device allocation") ||
++                               device_out_bytes, "output device allocation") ||
+         !moe_cache_grow_host(device, (void **)&device.h_out, device.h_out_cap,
+                              out_bytes, "output host allocation")) {
+         std::lock_guard<std::mutex> lock(session.mu);
+@@ -2689,13 +2750,17 @@ static int moe_cache_dispatch_internal(
+     float * h_act = (float *)(device.h_input + ids_bytes);
+     int32_t * d_ids = (int32_t *)device.d_input;
+     float * d_act = (float *)(device.d_input + ids_bytes);
++    int id_cursor = 1 + (fused ? 1 : 0);
+     for (int index = 0; index < n_hits; index++) {
+         h_ids[index] = slot_indices[index];
+         if (fused) {
+             h_ids[n_hits + index] = gate_slot_indices[index];
+         }
++        if (fused_down) {
++            h_ids[id_cursor * n_hits + index] = down_slot_indices[index];
++        }
+         if (use_activation_map) {
+-            h_ids[(fused ? 2 : 1) * n_hits + index] =
++            h_ids[(id_cursor + (fused_down ? 1 : 0)) * n_hits + index] =
+                 activation_indices[index];
+         }
+     }
+@@ -2718,22 +2783,25 @@ static int moe_cache_dispatch_internal(
+         ok = moe_cache_cuda_ok(
+                 device, cudaPeekAtLastError(), "activation quantization", true);
+     }
++    const int32_t * d_act_ids = use_activation_map
++        ? d_ids + (1 + (fused ? 1 : 0) + (fused_down ? 1 : 0)) * n_hits
++        : nullptr;
++    const int32_t * d_down_ids = fused_down
++        ? d_ids + (1 + (fused ? 1 : 0)) * n_hits : nullptr;
+     if (ok) {
+         if (fused) {
+             ggml_cuda_moe_cache_mmv_fused(
+                     pool.slab, gate_pool->slab, (ggml_type)wtype,
+                     (const char *)device.d_act_q8,
+-                    d_ids, d_ids + n_hits,
+-                    use_activation_map ? d_ids + 2 * n_hits : nullptr,
+-                    device.d_out, n_in, n_out,
++                    d_ids, d_ids + n_hits, d_act_ids,
++                    device.d_out, n_in, mid_out,
+                     (int64_t)pool.expert_size, n_hits, activation_rows,
+                     up_min, up_max, gate_min, gate_max,
+                     device.compute_stream);
+         } else {
+             ggml_cuda_moe_cache_mmv(
+                     pool.slab, (ggml_type)wtype,
+-                    (const char *)device.d_act_q8, d_ids,
+-                    use_activation_map ? d_ids + n_hits : nullptr,
++                    (const char *)device.d_act_q8, d_ids, d_act_ids,
+                     device.d_out, n_in, n_out, pool.n_slots,
+                     (int64_t)pool.expert_size, n_hits, activation_rows,
+                     device.compute_stream);
+@@ -2741,6 +2809,28 @@ static int moe_cache_dispatch_internal(
+         ok = moe_cache_cuda_ok(
+                 device, cudaPeekAtLastError(), "expert matvec launch", true);
+     }
++    if (ok && fused_down) {
++        quantize_row_q8_1_cuda(
++                device.d_out, nullptr, device.d_act_q8, (ggml_type)wtype,
++                mid_out, mid_out, (int64_t)n_hits * mid_out,
++                (int64_t)n_hits * mid_out, padded_mid,
++                n_hits, 1, 1, device.compute_stream);
++        ok = moe_cache_cuda_ok(
++                device, cudaPeekAtLastError(), "glu quantization", true);
++        if (ok) {
++            ggml_cuda_moe_cache_mmv(
++                    down_pool->slab, (ggml_type)wtype,
++                    (const char *)device.d_act_q8, d_down_ids, nullptr,
++                    device.d_out, mid_out, n_out, down_pool->n_slots,
++                    (int64_t)down_pool->expert_size, n_hits, n_hits,
++                    device.compute_stream);
++            ok = moe_cache_cuda_ok(
++                    device, cudaPeekAtLastError(), "down expert matvec launch", true);
++        }
++    }
++    if (ok) {
++        ok = moe_cache_enqueue_output_download(device, n_hits, n_out);
++    }
+ 
+     if (!ok) {
+         cudaStreamSynchronize(device.compute_stream);
+@@ -2750,6 +2840,9 @@ static int moe_cache_dispatch_internal(
+     }
+ 
+     device.activation_dedup += n_hits - activation_rows;
++    device.download_prefetch++;
++    device.dispatch_ns += (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now() - dispatch_started).count();
+     node->dispatched = true;
+     return 1;
+ }
+@@ -2769,6 +2862,7 @@ static int moe_cache_dispatch(
+                 0.0f, 0.0f, 0.0f, 0.0f);
+         if (ok) {
+             node->lane_dispatched[0] = true;
++            node->lane_downloaded[0] = true;
+             node->lane_n[0] = n_hits;
+             for (int index = 0; index < n_hits; index++) {
+                 node->lane_dst[0][index] = index;
+@@ -2808,6 +2902,7 @@ static int moe_cache_dispatch(
+             return 0;
+         }
+         node->lane_dispatched[lane] = true;
++        node->lane_downloaded[lane] = true;
+         launched++;
+     }
+     node->dispatched = launched > 0;
+@@ -2817,7 +2912,8 @@ static int moe_cache_dispatch(
+ static int moe_cache_collect(
+         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
+     moe_cache_node * node = (moe_cache_node *)opaque;
+-    const int pins_per_hit = node && node->host_base2 ? 2 : 1;
++    const int pins_per_hit = node && node->host_base_down ? 3
++        : (node && node->host_base2 ? 2 : 1);
+     if (!node || !node->dispatched || n_hits <= 0 ||
+         n_hits > moe_cache_node_rows_max ||
+         n_hits * pins_per_hit != node->n_pins ||
+@@ -2833,7 +2929,15 @@ static int moe_cache_collect(
+     moe_cache_session & session = *node->session;
+     const int n_lanes = node->n_lanes > 1 ? node->n_lanes : 1;
+     bool ok = !moe_cache_fail(session, "collect");
+-    int collected = 0;
++
++    struct moe_cache_collect_lane {
++        moe_cache_device * device = nullptr;
++        int lane = 0;
++        int hits = 0;
++        bool ok = true;
++    };
++    moe_cache_collect_lane lanes[moe_cache_max_lanes];
++    int n_work = 0;
+     for (int lane = 0; lane < n_lanes; lane++) {
+         moe_cache_device * device = n_lanes > 1 ? node->devices[lane] : node->device;
+         const int lane_hits = n_lanes > 1 ? node->lane_n[lane] : n_hits;
+@@ -2841,47 +2945,73 @@ static int moe_cache_collect(
+         if (!device || !launched || lane_hits <= 0) {
+             continue;
+         }
+-        ggml_cuda_set_device(device->logical);
+-        bool lane_ok = ok && !device->dead.load();
+-        const size_t bytes = (size_t)lane_hits * n_out * sizeof(float);
+-        if (lane_ok) {
+-            lane_ok = moe_cache_cuda_ok(*device, cudaMemcpyAsync(
+-                    device->h_out, device->d_out, bytes,
+-                    cudaMemcpyDeviceToHost, device->compute_stream),
+-                    "output download", true);
+-        }
+-        if (lane_ok) {
+-            lane_ok = moe_cache_cuda_ok(
+-                    *device, cudaStreamSynchronize(device->compute_stream),
+-                    "output synchronization", true);
+-        } else {
+-            cudaStreamSynchronize(device->compute_stream);
++        lanes[n_work++] = {device, lane, lane_hits, true};
++    }
++
++    for (int index = 0; index < n_work; index++) {
++        moe_cache_collect_lane & work = lanes[index];
++        ggml_cuda_set_device(work.device->logical);
++        work.ok = ok && !work.device->dead.load();
++        if (work.ok && !node->lane_downloaded[work.lane]) {
++            work.ok = moe_cache_enqueue_output_download(
++                    *work.device, work.hits, n_out);
++            if (work.ok) {
++                node->lane_downloaded[work.lane] = true;
++            }
+         }
+-        if (lane_ok) {
+-            for (int index = 0; index < lane_hits; index++) {
+-                const int dst = n_lanes > 1 ? node->lane_dst[lane][index] : index;
++        if (!work.ok) {
++            ok = false;
++        }
++    }
++
++    const auto wait_started = std::chrono::steady_clock::now();
++    for (int index = 0; index < n_work; index++) {
++        moe_cache_collect_lane & work = lanes[index];
++        ggml_cuda_set_device(work.device->logical);
++        if (work.ok) {
++            work.ok = moe_cache_sync_compute(*work.device);
++        } else if (work.device->compute_stream) {
++            cudaStreamSynchronize(work.device->compute_stream);
++        }
++        ok = ok && work.ok;
++    }
++    const long long wait_ns = (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now() - wait_started).count();
++    if (node->device) {
++        node->device->collect_wait_ns += wait_ns;
++    }
++
++    int collected = 0;
++    for (int index = 0; index < n_work; index++) {
++        moe_cache_collect_lane & work = lanes[index];
++        if (work.ok) {
++            for (int row = 0; row < work.hits; row++) {
++                const int dst = n_lanes > 1 ? node->lane_dst[work.lane][row] : row;
+                 if (dst < 0 || dst >= n_hits) {
+-                    lane_ok = false;
++                    work.ok = false;
+                     break;
+                 }
+-                memcpy(dst_rows[dst], device->h_out + (size_t)index * n_out,
+-                       n_out * sizeof(float));
++                memcpy(dst_rows[dst], work.device->h_out + (size_t)row * n_out,
++                       (size_t)n_out * sizeof(float));
+             }
+         }
+-        node->lane_dispatched[lane] = false;
++        node->lane_dispatched[work.lane] = false;
++        node->lane_downloaded[work.lane] = false;
+         {
+             std::lock_guard<std::mutex> lock(session.mu);
+-            if (!lane_ok) {
+-                device->collect_failures++;
++            if (!work.ok) {
++                work.device->collect_failures++;
+             }
+-            device->collect_calls++;
++            work.device->collect_calls++;
+             if (session.config.stats_every > 0 &&
+-                device->collect_calls % session.config.stats_every == 0) {
+-                moe_cache_log_stats(*device);
++                work.device->collect_calls % session.config.stats_every == 0) {
++                moe_cache_log_stats(*work.device);
+             }
+         }
+-        ok = ok && lane_ok;
+-        collected += lane_hits;
++        ok = ok && work.ok;
++        if (work.ok) {
++            collected += work.hits;
++        }
+     }
+     node->dispatched = false;
+     return ok && collected == n_hits ? 1 : 0;
+@@ -2922,7 +3052,7 @@ static void moe_cache_end(void * opaque) {
+                 }
+             }
+         }
+-        for (const void * base : {node->host_base, node->host_base2}) {
++        for (const void * base : {node->host_base, node->host_base2, node->host_base_down}) {
+             if (!base) {
+                 continue;
+             }
+@@ -2958,7 +3088,8 @@ static void * moe_cache_fused_begin(
+         int glu_op, float up_min, float up_max,
+         float gate_min, float gate_max,
+         const int32_t * ids, int n_ids, int64_t n_tokens,
+-        const float * const * act_rows, uint64_t * hit_mask) {
++        const float * const * act_rows, uint64_t * hit_mask,
++        const ggml_moe_cache_tensor_desc * down = nullptr) {
+     if (hit_mask) {
+         *hit_mask = 0;
+     }
+@@ -2980,7 +3111,16 @@ static void * moe_cache_fused_begin(
+         up->n_in <= 0 || up->n_out <= 0 ||
+         up->n_expert <= 0 ||
+         up->type == GGML_TYPE_NVFP4 ||
+-        !moe_cache_type_supported((ggml_type)up->type)) {
++        !moe_cache_type_supported((ggml_type)up->type) ||
++        (down && (
++            !down->name || !down->data ||
++            down->data == up->data || down->data == gate->data ||
++            !moe_cache_tensor_name_supported(down->name) ||
++            down->type != up->type ||
++            down->n_expert != up->n_expert ||
++            down->n_in != up->n_out ||
++            down->n_out <= 0 ||
++            down->expert_size == 0))) {
+         return nullptr;
+     }
+     for (int index = 0; index < n_ids; index++) {
+@@ -3016,9 +3156,15 @@ static void * moe_cache_fused_begin(
+ 
+     int up_layer = -1;
+     int gate_layer = -1;
++    int down_layer = -1;
+     if (!moe_cache_layer_number(up->name, up_layer) ||
+         !moe_cache_layer_number(gate->name, gate_layer) ||
+-        up_layer != gate_layer) {
++        up_layer != gate_layer ||
++        (down && (!moe_cache_layer_number(down->name, down_layer) ||
++                  down_layer != up_layer))) {
++        return nullptr;
++    }
++    if (down && down->expert_size < session->config.min_expert_bytes) {
+         return nullptr;
+     }
+ 
+@@ -3032,6 +3178,7 @@ static void * moe_cache_fused_begin(
+     int pool_index = -1;
+     moe_cache_device * fused_devices[moe_cache_max_lanes] = {};
+     moe_cache_pool * fused_pools[moe_cache_max_lanes] = {};
++    moe_cache_pool * fused_down_pools[moe_cache_max_lanes] = {};
+     int fused_pool_indices[moe_cache_max_lanes] = {};
+     int fused_n_lanes = 0;
+     {
+@@ -3119,6 +3266,19 @@ static void * moe_cache_fused_begin(
+             fused_pool_indices[0] = pool_index;
+         }
+ 
++        if (down) {
++            for (int lane = 0; lane < fused_n_lanes; lane++) {
++                const int found = moe_cache_find_pool(
++                        *fused_devices[lane], down->expert_size, down->type);
++                if (found < 0 ||
++                    found >= (int)fused_devices[lane]->pools.size() ||
++                    !fused_devices[lane]->pools[found]->slab) {
++                    return nullptr;
++                }
++                fused_down_pools[lane] = fused_devices[lane]->pools[found].get();
++            }
++        }
++
+         auto acquire_source = [&](const void * base) {
+             try {
+                 moe_cache_session::active_source & source =
+@@ -3141,12 +3301,26 @@ static void * moe_cache_fused_begin(
+             }
+             return nullptr;
+         }
++        if (down && !acquire_source(down->data)) {
++            for (const void * base : {up->data, gate->data}) {
++                auto source = session->active_sources.find(base);
++                if (source != session->active_sources.end() &&
++                    --source->second.references == 0) {
++                    session->active_sources.erase(source);
++                }
++            }
++            return nullptr;
++        }
+         session->active_nodes++;
+     }
+ 
+     auto release_active = [&] {
+         std::lock_guard<std::mutex> lock(session->mu);
+-        for (const void * base : {up->data, gate->data}) {
++        const void * bases[] = { up->data, gate->data, down ? down->data : nullptr };
++        for (const void * base : bases) {
++            if (!base) {
++                continue;
++            }
+             auto source = session->active_sources.find(base);
+             if (source != session->active_sources.end() &&
+                 --source->second.references == 0) {
+@@ -3198,10 +3372,15 @@ static void * moe_cache_fused_begin(
+     }
+     node->host_base = up->data;
+     node->host_base2 = gate->data;
++    node->host_base_down = down ? down->data : nullptr;
+     node->expert_size = up->expert_size;
+     node->n_in = up->n_in;
+-    node->n_out = up->n_out;
++    node->n_mid = down ? up->n_out : 0;
++    node->n_out = down ? down->n_out : up->n_out;
+     node->n_expert = up->n_expert;
++    for (int lane = 0; lane < fused_n_lanes; lane++) {
++        node->down_pools[lane] = fused_down_pools[lane];
++    }
+     node->n_tokens = n_tokens;
+     node->wtype = up->type;
+     if (fused_n_lanes <= 1) {
+@@ -3211,9 +3390,11 @@ static void * moe_cache_fused_begin(
+ 
+     int32_t up_slots[moe_cache_node_rows_max];
+     int32_t gate_slots[moe_cache_node_rows_max];
++    int32_t down_slots[moe_cache_node_rows_max];
+     int32_t hit_lanes[moe_cache_node_rows_max];
+     int32_t resident_up[moe_cache_node_rows_max];
+     int32_t resident_gate[moe_cache_node_rows_max];
++    int32_t resident_down[moe_cache_node_rows_max];
+     int32_t resident_lane[moe_cache_node_rows_max];
+     const float * hit_acts[moe_cache_node_rows_max];
+     uint64_t mask = 0;
+@@ -3226,6 +3407,7 @@ static void * moe_cache_fused_begin(
+             for (int index = 0; index < n_ids; index++) {
+                 resident_up[index] = -1;
+                 resident_gate[index] = -1;
++                resident_down[index] = -1;
+                 resident_lane[index] = -1;
+                 const int32_t expert = ids[index];
+                 if (expert < 0 || expert >= up->n_expert) {
+@@ -3247,9 +3429,21 @@ static void * moe_cache_fused_begin(
+                         gate_found != lane_pool->map.end() &&
+                         lane_pool->slots[gate_found->second].state == moe_cache_slot_state::valid
+                             ? gate_found->second : -1;
+-                    if (up_slot >= 0 && gate_slot >= 0) {
++                    int down_slot = -1;
++                    if (down && fused_down_pools[lane]) {
++                        const auto down_found =
++                            fused_down_pools[lane]->map.find({down->data, expert});
++                        down_slot =
++                            down_found != fused_down_pools[lane]->map.end() &&
++                            fused_down_pools[lane]->slots[down_found->second].state ==
++                                moe_cache_slot_state::valid
++                                ? down_found->second : -1;
++                    }
++                    if (up_slot >= 0 && gate_slot >= 0 &&
++                        (!down || down_slot >= 0)) {
+                         resident_up[index] = up_slot;
+                         resident_gate[index] = gate_slot;
++                        resident_down[index] = down_slot;
+                         resident_lane[index] = lane;
+                         lane_device->pair_both++;
+                         break;
+@@ -3266,7 +3460,8 @@ static void * moe_cache_fused_begin(
+ 
+             for (int index = 0; index < n_ids; index++) {
+                 if (resident_up[index] < 0 || resident_gate[index] < 0 ||
+-                    resident_lane[index] < 0) {
++                    resident_lane[index] < 0 ||
++                    (down && resident_down[index] < 0)) {
+                     continue;
+                 }
+                 const int lane = resident_lane[index];
+@@ -3282,12 +3477,23 @@ static void * moe_cache_fused_begin(
+                 moe_cache_lru_push_back(*lane_pool, resident_gate[index]);
+                 node->pins[node->n_pins++] = {lane_pool, resident_up[index]};
+                 node->pins[node->n_pins++] = {lane_pool, resident_gate[index]};
++                if (down && fused_down_pools[lane]) {
++                    moe_cache_pool * down_pool = fused_down_pools[lane];
++                    moe_cache_slot & down_slot =
++                        down_pool->slots[resident_down[index]];
++                    down_slot.readers++;
++                    moe_cache_lru_remove(*down_pool, resident_down[index]);
++                    moe_cache_lru_push_back(*down_pool, resident_down[index]);
++                    node->pins[node->n_pins++] = {down_pool, resident_down[index]};
++                    down_slots[hits] = moe_cache_pack_slot(
++                            lane, resident_down[index]);
++                }
+                 up_slots[hits] = moe_cache_pack_slot(lane, resident_up[index]);
+                 gate_slots[hits] = moe_cache_pack_slot(lane, resident_gate[index]);
+                 hit_lanes[hits] = lane;
+                 hit_acts[hits] = act_rows[index];
+                 mask |= UINT64_C(1) << index;
+-                lane_device->hits += 2;
++                lane_device->hits += down ? 3 : 2;
+                 hits++;
+             }
+ 
+@@ -3334,12 +3540,35 @@ static void * moe_cache_fused_begin(
+                     lane_device->misses++;
+                 }
+ 
++                int queued_down = -1;
++                if (down && fused_down_pools[target]) {
++                    queued_down = moe_cache_lookup_or_queue_locked(
++                            *session, *lane_device, *fused_down_pools[target],
++                            moe_cache_find_pool(
++                                    *lane_device, down->expert_size, down->type),
++                            down->data, expert, down->expert_size,
++                            inserts_left, wake_worker);
++                    if (queued_down >= 0) {
++                        moe_cache_slot & slot =
++                            fused_down_pools[target]->slots[queued_down];
++                        slot.readers++;
++                        moe_cache_lru_remove(*fused_down_pools[target], queued_down);
++                        moe_cache_lru_push_back(*fused_down_pools[target], queued_down);
++                        lane_device->hits++;
++                    } else {
++                        lane_device->misses++;
++                    }
++                }
++
+                 if (up_slot >= 0) {
+                     lane_pool->slots[up_slot].readers--;
+                 }
+                 if (gate_slot >= 0) {
+                     lane_pool->slots[gate_slot].readers--;
+                 }
++                if (queued_down >= 0) {
++                    fused_down_pools[target]->slots[queued_down].readers--;
++                }
+             }
+             if (hits > 0) {
+                 selected->nodes++;
+@@ -3354,11 +3583,15 @@ static void * moe_cache_fused_begin(
+     bool dispatched = false;
+     if (hits > 0 && fused_n_lanes <= 1) {
+         dispatched = moe_cache_dispatch_internal(
+-                node.get(), up->type, up->n_in, up->n_out, hits,
++                node.get(), up->type, up->n_in, node->n_out, hits,
+                 up_slots, hit_acts, pool, gate_slots, glu_op,
+-                up_min, up_max, gate_min, gate_max) != 0;
++                up_min, up_max, gate_min, gate_max,
++                nullptr, nullptr,
++                down ? fused_down_pools[0] : nullptr,
++                down ? down_slots : nullptr) != 0;
+         if (dispatched) {
+             node->lane_dispatched[0] = true;
++            node->lane_downloaded[0] = true;
+             node->lane_n[0] = hits;
+             for (int index = 0; index < hits; index++) {
+                 node->lane_dst[0][index] = index;
+@@ -3367,6 +3600,7 @@ static void * moe_cache_fused_begin(
+     } else if (hits > 0) {
+         int32_t lane_up[moe_cache_max_lanes][moe_cache_node_rows_max];
+         int32_t lane_gate[moe_cache_max_lanes][moe_cache_node_rows_max];
++        int32_t lane_down[moe_cache_max_lanes][moe_cache_node_rows_max];
+         const float * lane_acts[moe_cache_max_lanes][moe_cache_node_rows_max];
+         for (int lane = 0; lane < fused_n_lanes; lane++) {
+             node->lane_n[lane] = 0;
+@@ -3376,6 +3610,7 @@ static void * moe_cache_fused_begin(
+             const int local = node->lane_n[lane];
+             lane_up[lane][local] = up_slots[index];
+             lane_gate[lane][local] = gate_slots[index];
++            lane_down[lane][local] = down ? down_slots[index] : 0;
+             lane_acts[lane][local] = hit_acts[index];
+             node->lane_dst[lane][local] = index;
+             node->lane_n[lane]++;
+@@ -3386,14 +3621,17 @@ static void * moe_cache_fused_begin(
+                 continue;
+             }
+             if (!moe_cache_dispatch_internal(
+-                    node.get(), up->type, up->n_in, up->n_out, node->lane_n[lane],
++                    node.get(), up->type, up->n_in, node->n_out, node->lane_n[lane],
+                     lane_up[lane], lane_acts[lane], fused_pools[lane],
+                     lane_gate[lane], glu_op, up_min, up_max, gate_min, gate_max,
+-                    fused_devices[lane], fused_pools[lane])) {
++                    fused_devices[lane], fused_pools[lane],
++                    down ? fused_down_pools[lane] : nullptr,
++                    down ? lane_down[lane] : nullptr)) {
+                 dispatched = false;
+                 break;
+             }
+             node->lane_dispatched[lane] = true;
++            node->lane_downloaded[lane] = true;
+         }
+         node->dispatched = dispatched;
+     }
+@@ -3413,6 +3651,31 @@ static void * moe_cache_fused_begin(
+     return node.release();
+ }
+ 
++static void * moe_cache_fused_begin_public(
++        const ggml_moe_cache_tensor_desc * up,
++        const ggml_moe_cache_tensor_desc * gate,
++        int glu_op, float up_min, float up_max,
++        float gate_min, float gate_max,
++        const int32_t * ids, int n_ids, int64_t n_tokens,
++        const float * const * act_rows, uint64_t * hit_mask) {
++    return moe_cache_fused_begin(
++            up, gate, glu_op, up_min, up_max, gate_min, gate_max,
++            ids, n_ids, n_tokens, act_rows, hit_mask, nullptr);
++}
++
++static void * moe_cache_fused_begin_ex_public(
++        const ggml_moe_cache_tensor_desc * up,
++        const ggml_moe_cache_tensor_desc * gate,
++        const ggml_moe_cache_tensor_desc * down,
++        int glu_op, float up_min, float up_max,
++        float gate_min, float gate_max,
++        const int32_t * ids, int n_ids, int64_t n_tokens,
++        const float * const * act_rows, uint64_t * hit_mask) {
++    return moe_cache_fused_begin(
++            up, gate, glu_op, up_min, up_max, gate_min, gate_max,
++            ids, n_ids, n_tokens, act_rows, hit_mask, down);
++}
++
+ static void moe_cache_invalidate_session(
+         moe_cache_session & session, const void * base, size_t size) {
+     std::unique_lock<std::mutex> lock(session.mu);
+@@ -3582,7 +3845,8 @@ void ggml_moe_cache_register(const void * owner) {
+     ggml_moe_cache.dispatch = moe_cache_dispatch;
+     ggml_moe_cache.collect = moe_cache_collect;
+     ggml_moe_cache.end = moe_cache_end;
+-    ggml_moe_cache.fused_begin = moe_cache_fused_begin;
++    ggml_moe_cache.fused_begin = moe_cache_fused_begin_public;
++    ggml_moe_cache.fused_begin_ex = moe_cache_fused_begin_ex_public;
+     ggml_moe_cache.invalidate = moe_cache_invalidate;
+ }
+ 
+diff --git a/tests/test-moe-cache.cpp b/tests/test-moe-cache.cpp
+index 76f9c975..e85f3d0b 100644
+--- a/tests/test-moe-cache.cpp
++++ b/tests/test-moe-cache.cpp
+@@ -2790,6 +2790,264 @@ static bool run_same_layer_split(
+     return ok;
+ }
+ 
++static bool run_same_layer_split_collect(
++        ggml_backend_dev_t first_device,
++        ggml_backend_t cuda, ggml_backend_t cpu,
++        ggml_tensor * up_weights,
++        ggml_tensor * gate_weights,
++        ggml_tensor * activations,
++        const std::vector<float> & fused_reference,
++        log_capture & capture) {
++    ggml_backend_dev_t second_device = find_other_cuda_device(first_device);
++    if (!second_device ||
++        (cuda_physical_device(first_device) >= 0 &&
++         cuda_physical_device(first_device) ==
++             cuda_physical_device(second_device))) {
++        printf("cache-same-layer-split-collect: SKIP (one CUDA device)\n");
++        return true;
++    }
++    if (!ggml_moe_cache.fused_begin || !ggml_moe_cache.collect ||
++        !ggml_moe_cache.end) {
++        fprintf(stderr, "cache-same-layer-split-collect: incomplete cache API\n");
++        return false;
++    }
++    ggml_backend_t second_cuda =
++        ggml_backend_dev_init(second_device, nullptr);
++    if (!second_cuda) {
++        fprintf(stderr,
++                "cache-same-layer-split-collect: failed to initialize second device\n");
++        return false;
++    }
++
++    configure_cache(nullptr);
++    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
++    set_env("GGML_CUDA_MOE_CACHE_NDEV", "2");
++    set_env("GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS", "1");
++    set_env("GGML_CUDA_MOE_CACHE_STATS", "1");
++    capture.clear();
++
++    void * backends[] = { cuda, second_cuda, cpu };
++    void * session = ggml_moe_cache.session_create(backends, 3, nullptr);
++    if (!session) {
++        fprintf(stderr, "cache-same-layer-split-collect: failed to create session\n");
++        ggml_backend_free(second_cuda);
++        return false;
++    }
++
++    const size_t expert_size =
++        ggml_nbytes(up_weights) / up_weights->ne[2];
++    const ggml_moe_cache_tensor_desc up = {
++        up_weights->name, up_weights->data, expert_size,
++        up_weights->ne[0], up_weights->ne[1], up_weights->ne[2],
++        (int32_t)up_weights->type,
++    };
++    const ggml_moe_cache_tensor_desc gate = {
++        gate_weights->name, gate_weights->data, expert_size,
++        gate_weights->ne[0], gate_weights->ne[1], gate_weights->ne[2],
++        (int32_t)gate_weights->type,
++    };
++    const float * act_rows[2] = {
++        (const float *)activations->data,
++        (const float *)activations->data,
++    };
++
++    ggml_moe_cache.session_enter(session);
++    bool ready = false;
++    for (int step = 0; step < 80 && !ready; step++) {
++        ready = direct_begin_ready(
++                    up_weights->name, up_weights->data, expert_size,
++                    up_weights->ne[0], up_weights->ne[1], up_weights->type,
++                    up_weights->ne[2]) &&
++            direct_begin_ready(
++                    gate_weights->name, gate_weights->data, expert_size,
++                    gate_weights->ne[0], gate_weights->ne[1],
++                    gate_weights->type, gate_weights->ne[2]);
++    }
++    ready = ready &&
++        wait_for_direct_resident(up_weights, 0) &&
++        wait_for_direct_resident(up_weights, 1) &&
++        wait_for_direct_resident(gate_weights, 0) &&
++        wait_for_direct_resident(gate_weights, 1);
++
++    bool collected_ok = false;
++    if (ready) {
++        const int32_t experts[2] = { 0, 1 };
++        uint64_t hit_mask = 0;
++        void * node = ggml_moe_cache.fused_begin(
++                &up, &gate, GGML_GLU_OP_SWIGLU,
++                -std::numeric_limits<float>::infinity(),
++                std::numeric_limits<float>::infinity(),
++                -std::numeric_limits<float>::infinity(),
++                std::numeric_limits<float>::infinity(),
++                experts, 2, 1, act_rows, &hit_mask);
++        if (node && hit_mask == UINT64_C(3)) {
++            float output[2 * n_out];
++            float * rows[2] = { output, output + n_out };
++            collected_ok =
++                ggml_moe_cache.collect(node, 2, rows, n_out) == 1;
++            ggml_moe_cache.end(node);
++            if (collected_ok) {
++                std::vector<float> actual(output, output + 2 * n_out);
++                collected_ok = compare_output(fused_reference, actual, 5e-4);
++            }
++        } else if (node) {
++            ggml_moe_cache.end(node);
++        }
++    }
++    ggml_moe_cache.session_leave(session);
++    ggml_moe_cache.session_destroy(session);
++    ggml_backend_free(second_cuda);
++
++    const std::string log = capture.get();
++    const bool split_announced = log.find("split-experts=on") != std::string::npos;
++    const bool both_gpus =
++        log.find("CUDA0 ") != std::string::npos &&
++        log.find("CUDA1 ") != std::string::npos;
++    const bool prefetch =
++        has_positive_field(log, "download-prefetch=");
++    const bool ok = ready && collected_ok && split_announced &&
++        both_gpus && prefetch;
++    if (!ok) {
++        fprintf(stderr,
++                "cache-same-layer-split-collect: collect path failed ready=%d collected=%d\n%s",
++                (int)ready, (int)collected_ok, log.c_str());
++    }
++    printf("cache-same-layer-split-collect: %s\n", ok ? "OK" : "FAIL");
++    return ok;
++}
++
++static bool run_fused_down_collect(
++        ggml_backend_t cuda, ggml_backend_t cpu,
++        ggml_tensor * up_weights,
++        ggml_tensor * gate_weights,
++        ggml_tensor * activations,
++        log_capture & capture) {
++    if (!ggml_moe_cache.fused_begin_ex || !ggml_moe_cache.collect) {
++        fprintf(stderr, "cache-fused-down: fused_begin_ex missing\n");
++        return false;
++    }
++
++    ggml_init_params params = {
++        16 * ggml_tensor_overhead() + ggml_graph_overhead(),
++        nullptr,
++        true,
++    };
++    ggml_context * ctx = ggml_init(params);
++    if (!ctx) {
++        return false;
++    }
++    ggml_tensor * down_weights = ggml_new_tensor_3d(
++            ctx, GGML_TYPE_Q4_0, n_out, n_in, n_expert);
++    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
++    ggml_set_name(down_weights, "blk.0.ffn_down_exps.weight");
++    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
++    if (!buffer || !down_weights->data) {
++        if (buffer) {
++            ggml_backend_buffer_free(buffer);
++        }
++        ggml_free(ctx);
++        return false;
++    }
++    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    std::vector<float> down_f32(ggml_nelements(down_weights));
++    for (size_t index = 0; index < down_f32.size(); index++) {
++        down_f32[index] = 0.09f * std::sin((float)(index % 641) * 0.019f);
++    }
++    std::vector<uint8_t> down_q4(ggml_nbytes(down_weights));
++    if (ggml_quantize_chunk(
++                GGML_TYPE_Q4_0, down_f32.data(), down_q4.data(),
++                0, n_in * n_expert, n_out, nullptr) != down_q4.size()) {
++        ggml_backend_buffer_free(buffer);
++        ggml_free(ctx);
++        return false;
++    }
++    ggml_backend_tensor_set(down_weights, down_q4.data(), 0, down_q4.size());
++    const int32_t expert0 = 0;
++    ggml_backend_tensor_set(ids, &expert0, 0, sizeof(expert0));
++
++    configure_cache(nullptr);
++    capture.clear();
++    void * session = create_direct_session(cuda, cpu);
++    if (!session) {
++        ggml_backend_buffer_free(buffer);
++        ggml_free(ctx);
++        return false;
++    }
++
++    const size_t up_expert = ggml_nbytes(up_weights) / up_weights->ne[2];
++    const size_t down_expert = ggml_nbytes(down_weights) / down_weights->ne[2];
++    const ggml_moe_cache_tensor_desc up_desc = {
++        up_weights->name, up_weights->data, up_expert,
++        up_weights->ne[0], up_weights->ne[1], up_weights->ne[2],
++        (int32_t)up_weights->type,
++    };
++    const ggml_moe_cache_tensor_desc gate_desc = {
++        gate_weights->name, gate_weights->data, up_expert,
++        gate_weights->ne[0], gate_weights->ne[1], gate_weights->ne[2],
++        (int32_t)gate_weights->type,
++    };
++    const ggml_moe_cache_tensor_desc down_desc = {
++        down_weights->name, down_weights->data, down_expert,
++        down_weights->ne[0], down_weights->ne[1], down_weights->ne[2],
++        (int32_t)down_weights->type,
++    };
++    const float * act_rows[1] = { (const float *)activations->data };
++
++    ggml_moe_cache.session_enter(session);
++    bool ready = false;
++    for (int step = 0; step < 80 && !ready; step++) {
++        ready = direct_begin_ready(
++                    up_weights->name, up_weights->data, up_expert,
++                    up_weights->ne[0], up_weights->ne[1], up_weights->type,
++                    up_weights->ne[2]) &&
++            direct_begin_ready(
++                    down_weights->name, down_weights->data, down_expert,
++                    down_weights->ne[0], down_weights->ne[1],
++                    down_weights->type, down_weights->ne[2]);
++    }
++    ready = ready &&
++        wait_for_direct_resident(up_weights, 0) &&
++        wait_for_direct_resident(gate_weights, 0) &&
++        wait_for_direct_resident(down_weights, 0);
++
++    bool ok = false;
++    if (ready) {
++        uint64_t hit_mask = 0;
++        void * node = ggml_moe_cache.fused_begin_ex(
++                &up_desc, &gate_desc, &down_desc, GGML_GLU_OP_SWIGLU,
++                -std::numeric_limits<float>::infinity(),
++                std::numeric_limits<float>::infinity(),
++                -std::numeric_limits<float>::infinity(),
++                std::numeric_limits<float>::infinity(),
++                &expert0, 1, 1, act_rows, &hit_mask);
++        if (node && hit_mask == UINT64_C(1)) {
++            std::vector<float> actual(n_in, 0.0f);
++            float * rows[1] = { actual.data() };
++            ok = ggml_moe_cache.collect(node, 1, rows, n_in) == 1;
++            if (ok) {
++                bool finite = true;
++                bool nonzero = false;
++                for (float value : actual) {
++                    finite = finite && std::isfinite(value);
++                    nonzero = nonzero || value != 0.0f;
++                }
++                ok = finite && nonzero;
++            }
++            ggml_moe_cache.end(node);
++        } else if (node) {
++            ggml_moe_cache.end(node);
++        }
++    }
++    ggml_moe_cache.session_leave(session);
++    ggml_moe_cache.session_destroy(session);
++    ggml_backend_buffer_free(buffer);
++    ggml_free(ctx);
++
++    printf("cache-fused-down: %s\n", ok ? "OK" : "FAIL");
++    return ok;
++}
++
+ static bool run_admission_policy_once(
+         ggml_backend_t cuda, ggml_backend_t cpu,
+         int new_expert_misses, log_capture & capture) {
+@@ -3206,6 +3464,11 @@ int main() {
+     ok &= run_shared_budget(cuda, cpu, capture);
+     ok &= run_route_override(cuda_device, cuda, cpu, capture);
+     ok &= run_same_layer_split(cuda_device, cuda, cpu, capture);
++    ok &= run_same_layer_split_collect(
++            cuda_device, cuda, cpu, weights, gate_weights,
++            activations, fused_reference, capture);
++    ok &= run_fused_down_collect(
++            cuda, cpu, weights, gate_weights, activations, capture);
+     ok &= run_admission_policy(cuda, cpu, capture);
+ 
+     free_graph(clamped_fused_graph);
+diff --git a/tools/llama-bench/CMakeLists.txt b/tools/llama-bench/CMakeLists.txt
+index b1c35ee8..7bf8b17e 100644
+--- a/tools/llama-bench/CMakeLists.txt
++++ b/tools/llama-bench/CMakeLists.txt
+@@ -7,6 +7,11 @@ set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+ 
+ target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+ target_link_libraries(${TARGET} PUBLIC llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++if (GGML_CUDA)
++    find_package(CUDAToolkit REQUIRED)
++    target_link_libraries(${TARGET} PRIVATE CUDA::cudart)
++    target_compile_definitions(${TARGET} PRIVATE GGML_USE_CUDA)
++endif()
+ 
+ if(LLAMA_TOOLS_INSTALL)
+     install(TARGETS ${TARGET} LIBRARY)
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index 58a261a2..12630ec6 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -37,6 +37,11 @@
+ #    include <windows.h>
+ #endif
+ 
++#if defined(GGML_USE_CUDA)
++#    include <cuda_profiler_api.h>
++#    include <cuda_runtime.h>
++#endif
++
+ // utils
+ static uint64_t get_time_ns() {
+     using clock = std::chrono::high_resolution_clock;
+@@ -2426,6 +2431,29 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
+     return true;
+ }
+ 
++static bool llama_bench_profile_generation() {
++    const char * value = std::getenv("LLAMA_BENCH_PROFILE_GENERATION");
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++}
++
++static void llama_bench_profiler_start() {
++#if defined(GGML_USE_CUDA)
++    if (llama_bench_profile_generation()) {
++        (void)cudaProfilerStart();
++    }
++#else
++    (void)llama_bench_profile_generation();
++#endif
++}
++
++static void llama_bench_profiler_stop() {
++#if defined(GGML_USE_CUDA)
++    if (llama_bench_profile_generation()) {
++        (void)cudaProfilerStop();
++    }
++#endif
++}
++
+ static bool test_gen(llama_context * ctx, int n_gen, int n_threads, uint64_t seed) {
+     llama_set_n_threads(ctx, n_threads, n_threads);
+ 
+@@ -2453,6 +2481,14 @@ static void llama_null_log_callback(enum ggml_log_level level, const char * text
+     (void) user_data;
+ }
+ 
++static void llama_bench_info_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
++    (void) user_data;
++    if (level == GGML_LOG_LEVEL_DEBUG) {
++        return;
++    }
++    fputs(text, stderr);
++}
++
+ static std::unique_ptr<printer> create_printer(output_formats format) {
+     switch (format) {
+         case NONE:
+@@ -2507,7 +2543,7 @@ int llama_bench(int argc, char ** argv) {
+ 
+     // initialize llama.cpp
+     if (!params.verbose) {
+-        llama_log_set(llama_null_log_callback, NULL);
++        llama_log_set(llama_bench_info_log_callback, NULL);
+     }
+     llama_backend_init();
+     llama_numa_init(params.numa);
+@@ -2670,6 +2706,7 @@ int llama_bench(int argc, char ** argv) {
+             }
+         }
+ 
++        const bool profile_generation = llama_bench_profile_generation();
+         for (int i = 0; i < params.reps; i++) {
+             llama_memory_clear(llama_get_memory(ctx), false);
+ 
+@@ -2717,6 +2754,9 @@ int llama_bench(int argc, char ** argv) {
+                 }
+             }
+ 
++            if (profile_generation && i == 0) {
++                llama_bench_profiler_start();
++            }
+             uint64_t t_start = get_time_ns();
+ 
+             if (t.n_prompt > 0) {
+@@ -2750,6 +2790,9 @@ int llama_bench(int argc, char ** argv) {
+ 
+             uint64_t t_ns = get_time_ns() - t_start;
+             t.samples_ns.push_back(t_ns);
++            if (profile_generation && i + 1 == params.reps) {
++                llama_bench_profiler_stop();
++            }
+         }
+ 
+         if (p) {
+-- 
+2.50.1.windows.1
+

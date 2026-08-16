@@ -1,0 +1,401 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RX5950XT <123271969+RX5950XT@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 12:44:32 +0800
+Subject: [PATCH 3/6] perf: keep GQA K-quants native
+
+
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 4384557..d286752 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -650,6 +650,12 @@ mod real {
+         Kq(KqW),
+     }
+ 
++    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
++    enum MatLoad {
++        Q8,
++        Kq { bytes: u64, row_bytes: u64, quant: u32 },
++    }
++
+     impl MatW {
+         /// True when this tensor should stay native: a K-quant with a
+         /// warp-cooperative dot and a 256-divisible contraction dim.
+@@ -657,14 +663,78 @@ mod real {
+             matches!(t.ty, TensorType::Q4K | TensorType::Q6K) && t.dims[0].is_multiple_of(256)
+         }
+ 
+-        fn load(file: &VFile, g: &Gguf, name: &str) -> Result<MatW> {
+-            let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
++        fn plan(t: &TensorInfo) -> MatLoad {
+             if Self::keep_native(t) {
+-                Ok(MatW::Kq(upload_kq(file, g, name)?))
++                MatLoad::Kq {
++                    bytes: t.byte_size().expect("known K-quant byte layout"),
++                    row_bytes: t.ty.row_bytes(t.dims[0]).expect("known K-quant row layout"),
++                    quant: quant_code(t.ty).expect("native MatW quant code"),
++                }
+             } else {
+-                Ok(MatW::Q8(upload(file, g, name)?))
++                MatLoad::Q8
++            }
++        }
++
++        fn load(file: &VFile, g: &Gguf, name: &str) -> Result<MatW> {
++            let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
++            match Self::plan(t) {
++                MatLoad::Kq { .. } => Ok(MatW::Kq(upload_kq(file, g, name)?)),
++                MatLoad::Q8 => Ok(MatW::Q8(upload(file, g, name)?)),
++            }
++        }
++
++        fn load_attn(file: &VFile, g: &Gguf, name: &str, vram_budget: &mut i64) -> Result<MatW> {
++            let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
++            match Self::plan(t) {
++                MatLoad::Kq { .. } => Ok(MatW::Kq(upload_kq_attn(file, g, name, vram_budget)?)),
++                MatLoad::Q8 => Ok(MatW::Q8(upload_attn(file, g, name, vram_budget)?)),
+             }
+         }
++
++        fn is_kq(&self) -> bool {
++            matches!(self, MatW::Kq(_))
++        }
++    }
++
++    fn matw(out: &mut DeviceBuf, w: &MatW, x: &DeviceBuf, xq: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
++        match w {
++            MatW::Q8(w) => kernels::matmul_q8_0(out, w, x, in_dim, out_dim, n_tok)?,
++            MatW::Kq(w) => kernels::matmul_kq(out, &w.w, xq, in_dim, out_dim, n_tok, w.row_bytes, w.quant)?,
++        }
++        Ok(())
++    }
++
++    #[cfg(test)]
++    mod matw_tests {
++        use super::*;
++
++        fn tensor(ty: TensorType, dims: &[u64]) -> TensorInfo {
++            TensorInfo { name: "projection.weight".to_owned(), dims: dims.to_vec(), ty, offset: 0 }
++        }
++
++        #[test]
++        fn gqa_projection_plan_keeps_apex_q4k_native() {
++            assert_eq!(
++                MatW::plan(&tensor(TensorType::Q4K, &[512, 3])),
++                MatLoad::Kq { bytes: 864, row_bytes: 288, quant: kernels::QUANT_Q4_K }
++            );
++        }
++
++        #[test]
++        fn gqa_projection_plan_keeps_q6k_native() {
++            assert_eq!(
++                MatW::plan(&tensor(TensorType::Q6K, &[256, 2])),
++                MatLoad::Kq { bytes: 420, row_bytes: 210, quant: kernels::QUANT_Q6_K }
++            );
++        }
++
++        #[test]
++        fn gqa_projection_plan_preserves_q8_fallback_compatibility() {
++            for ty in [TensorType::F16, TensorType::Q8_0] {
++                assert_eq!(MatW::plan(&tensor(ty, &[256, 2])), MatLoad::Q8);
++            }
++            assert_eq!(MatW::plan(&tensor(TensorType::Q4K, &[128, 2])), MatLoad::Q8);
++        }
+     }
+ 
+     #[allow(clippy::large_enum_variant)] // one Ffn per layer; boxing would indirect the decode hot path
+@@ -769,10 +839,13 @@ mod real {
+ 
+     enum Attn {
+         Gqa {
+-            attn_q: DeviceBuf,
++            attn_q: MatW,
+             /// None = k reused as v (gemma E-series attention_k_eq_v)
+-            attn_v: Option<DeviceBuf>,
+-            attn_k: DeviceBuf,
++            attn_v: Option<MatW>,
++            attn_k: MatW,
++            attn_output: MatW,
++            /// Laguna per-head output gate; absent on other GQA models.
++            attn_gate: Option<MatW>,
+             /// None = the arch has no qk-norm at all (gpt-oss uses q/k
+             /// biases instead). Distinct from passing a null weight to the
+             /// norm kernel, which still normalizes, just without a scale.
+@@ -983,9 +1056,6 @@ mod real {
+         ffn: Ffn,
+         gemma: Option<GemmaW>,
+         ink: Option<InkW>,
+-        /// laguna per-head output gate (g_proj): softplus(x @ w) scales
+-        /// each attention head row before attn_output. None elsewhere.
+-        attn_gate: Option<DeviceBuf>,
+     }
+ 
+     /// The nextn/MTP draft block: predicts token t+2 from (hidden of
+@@ -2611,14 +2681,14 @@ mod real {
+     /// q8_0 (1.9x the VRAM and the wrong layout for matmul_kq).
+     fn upload_kq(file: &VFile, g: &Gguf, name: &str) -> Result<KqW> {
+         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+-        let quant = quant_code(t.ty)
+-            .ok_or_else(|| format!("{name}: unsupported K-quant type {:?}", t.ty))?;
+-        let bytes = t.byte_size().ok_or_else(|| meta_err(name))?;
++        let MatLoad::Kq { bytes, row_bytes, quant } = MatW::plan(t) else {
++            return Err(format!("{name}: unsupported native MatW type {:?}", t.ty).into());
++        };
+         let mut buf = vec![0u8; bytes as usize];
+         file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+         Ok(KqW {
+             w: DeviceBuf::from_bytes(&buf)?,
+-            row_bytes: t.ty.row_bytes(t.dims[0]).unwrap(),
++            row_bytes,
+             quant,
+         })
+     }
+@@ -2764,6 +2834,32 @@ mod real {
+         Ok(buf)
+     }
+ 
++    /// Native K-quant counterpart to upload_attn. Raw GGUF blocks stay
++    /// compact in VRAM and in the optional zero-copy host placement.
++    fn upload_kq_attn(
++        file: &VFile,
++        g: &Gguf,
++        name: &str,
++        vram_budget: &mut i64,
++    ) -> Result<KqW> {
++        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
++        let MatLoad::Kq { bytes, row_bytes, quant } = MatW::plan(t) else {
++            return Err(format!("{name}: unsupported native attention type {:?}", t.ty).into());
++        };
++        let mut raw = vec![0u8; bytes as usize];
++        file.read_exact_at(&mut raw, g.data_offset + t.offset)?;
++        let force_host = std::env::var("PULSAR_ATTN_HOST").ok().as_deref() == Some("1");
++        let use_vram = !force_host && *vram_budget >= bytes as i64;
++        let mut w = if use_vram {
++            *vram_budget -= bytes as i64;
++            DeviceBuf::alloc(bytes as usize)?
++        } else {
++            DeviceBuf::alloc_pinned(bytes as usize)?
++        };
++        w.write(0, &raw)?;
++        Ok(KqW { w, row_bytes, quant })
++    }
++
+     impl Model {
+         pub fn load(path: &Path) -> Result<Model> {
+             let (shards, gguf) = parse_header(path)?;
+@@ -3520,13 +3616,19 @@ mod real {
+                         }))
+                     }
+                     Family::Gqa => Attn::Gqa {
+-                        attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"), &mut *attn_vram_budget)?,
+-                        attn_k: upload_attn(&file, &gguf, &t("attn_k.weight"), &mut *attn_vram_budget)?,
++                        attn_q: MatW::load_attn(&file, &gguf, &t("attn_q.weight"), &mut *attn_vram_budget)?,
++                        attn_k: MatW::load_attn(&file, &gguf, &t("attn_k.weight"), &mut *attn_vram_budget)?,
+                         attn_v: if gguf.tensor(&t("attn_v.weight")).is_some() {
+-                            Some(upload_attn(&file, &gguf, &t("attn_v.weight"), &mut *attn_vram_budget)?)
++                            Some(MatW::load_attn(&file, &gguf, &t("attn_v.weight"), &mut *attn_vram_budget)?)
+                         } else {
+                             None // gemma attention_k_eq_v: k doubles as v
+                         },
++                        attn_output: MatW::load_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?,
++                        attn_gate: if gguf.tensor(&t("attn_gate.weight")).is_some() {
++                            Some(MatW::load_attn(&file, &gguf, &t("attn_gate.weight"), &mut *attn_vram_budget)?)
++                        } else {
++                            None
++                        },
+                         q_norm: if gguf.tensor(&t("attn_q_norm.weight")).is_some() {
+                             Some(upload(&file, &gguf, &t("attn_q_norm.weight"))?)
+                         } else {
+@@ -3702,6 +3804,9 @@ mod real {
+                 } else if shape.family == Family::K3 {
+                     // both K3 layer flavours keep their own out (MatW)
+                     DeviceBuf::alloc(1)?
++                } else if shape.family == Family::Gqa {
++                    // GQA carries output beside q/k/v as MatW.
++                    DeviceBuf::alloc(1)?
+                 } else {
+                     upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?
+                 };
+@@ -3813,13 +3918,6 @@ mod real {
+                     ffn,
+                     gemma,
+                     ink,
+-                    // laguna: per-head output gate (gating="per-head", so
+-                    // one column per QUERY head on this layer)
+-                    attn_gate: if gguf.tensor(&t("attn_gate.weight")).is_some() {
+-                        Some(upload(&file, &gguf, &t("attn_gate.weight"))?)
+-                    } else {
+-                        None
+-                    },
+                 })
+             };
+ 
+@@ -4317,6 +4415,10 @@ mod real {
+         // copied primary->attn GPU, attn output copied back
+         normed_a: DeviceBuf,
+         attn_out_a: DeviceBuf,
++        /// GQA native K-quant input/output activation rows (q8_K), on
++        /// the attention device when that graph is offloaded.
++        attn_xq: DeviceBuf,
++        attn_heads_xq: DeviceBuf,
+         /// laguna per-head attention gate logits [max_batch][n_head]
+         attn_gate_buf: DeviceBuf,
+         // resident expert tiers on leftover GPUs + the primary-side
+@@ -4996,7 +5098,7 @@ mod real {
+                         g.window != 0
+                             && m.layers
+                                 .get(i)
+-                                .is_some_and(|layer| layer.attn_gate.is_some())
++                                .is_some_and(|layer| matches!(&layer.attn, Attn::Gqa { attn_gate: Some(_), .. }))
+                     })
+                     .map_or(0, |g| g.window);
+                 gqa_kv_cache_plan(ctx, window, mb)
+@@ -5451,8 +5553,19 @@ mod real {
+                 (f32s(1)?, f32s(1)?)
+             };
+             // laguna output gate: one logit per (token, query head)
+-            let has_gate = m.layers.iter().any(|l| l.attn_gate.is_some());
++            let has_gate = m.layers.iter().any(|l| {
++                matches!(&l.attn, Attn::Gqa { attn_gate: Some(_), .. })
++            });
+             let attn_gate_buf = f32s(if has_gate { mb * s.n_head } else { 1 })?;
++            let q8k = |n: u32| {
++                (n as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
++            };
++            let attn_xq = DeviceBuf::alloc(if s.family == Family::Gqa {
++                mb as usize * q8k(s.n_embd)
++            } else { 1 })?;
++            let attn_heads_xq = DeviceBuf::alloc(if s.family == Family::Gqa {
++                mb as usize * q8k(s.n_head * s.head_dim)
++            } else { 1 })?;
+             // Gqa attention scratch beside the KV caches (attn card under
+             // offload, primary otherwise): raw k/v projections, inkling's
+             // rel-bias buffers and the k/v-stream shortconv state+tmp
+@@ -5673,6 +5786,8 @@ mod real {
+                 idx_last_sel: 0,
+                 normed_a,
+                 attn_out_a,
++                attn_xq,
++                attn_heads_xq,
+                 attn_gate_buf,
+                 tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
+                 // The CPU lane dots quantized weights directly and has no
+@@ -6117,23 +6232,16 @@ mod real {
+             // per-layer query head count: laguna varies it (48 full / 72
+             // sliding); 0 or no geom = uniform s.n_head
+             let nh_q = gm.map(|g| g.n_head_q).filter(|&v| v != 0).unwrap_or(s.n_head);
+-            let heads_dim = match (&l.attn, gm) {
+-                (Attn::Gqa { .. }, Some(g)) => nh_q * g.head_dim,
+-                _ => s.heads_dim(),
+-            };
+             {
+                 // attention
+                 kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, n_tok, eps)?;
+                 let mut attn_output_w: &DeviceBuf = &l.attn_output;
+-                // Mla runs its output projection inside the arm (per-layer
+-                // owner device); the common tail below must not re-run it
+-                let mut mla_attn_done = false;
+                 match &l.attn {
+                     // dsv4/qwen35/k3 have their own graphs
+                     Attn::Dsv4(_) | Attn::Qwen35(_) | Attn::K3(_) => {
+                         return Err("hybrid-family layer in the shared eval path".into())
+                     }
+-                    Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm, sinks } => {
++                    Attn::Gqa { attn_q, attn_k, attn_v, attn_output, attn_gate, q_norm, k_norm, sinks } => {
+                         let (hkv, hd, theta, window) = match gm {
+                             Some(g) => (g.n_head_kv, g.head_dim, g.theta, g.window),
+                             None => (s.n_head_kv, s.head_dim, s.rope_freq_base, 0),
+@@ -6150,15 +6258,22 @@ mod real {
+                             kernels::set_device(d)?;
+                         }
+                         let xin = if self.attn_dev.is_some() { &st.normed_a } else { &st.normed };
+-                        kernels::matmul_q8_0(&mut st.q, attn_q, xin, s.n_embd, nh_q * hd, n_tok)?;
+-                        kernels::matmul_q8_0(&mut st.k, attn_k, xin, s.n_embd, hkv * hd, n_tok)?;
++                        let input_kq = attn_q.is_kq()
++                            || attn_k.is_kq()
++                            || attn_v.as_ref().is_some_and(MatW::is_kq)
++                            || attn_gate.as_ref().is_some_and(MatW::is_kq);
++                        if input_kq {
++                            kernels::quantize_q8_k(&mut st.attn_xq, xin, s.n_embd, n_tok)?;
++                        }
++                        matw(&mut st.q, attn_q, xin, &st.attn_xq, s.n_embd, nh_q * hd, n_tok)?;
++                        matw(&mut st.k, attn_k, xin, &st.attn_xq, s.n_embd, hkv * hd, n_tok)?;
+                         if let Some(ab) = &l.attn_bias {
+                             kernels::add_bias_rows(&mut st.q, &ab.q, nh_q * hd, n_tok)?;
+                             kernels::add_bias_rows(&mut st.k, &ab.k, hkv * hd, n_tok)?;
+                         }
+                         match attn_v {
+                             Some(v_w) => {
+-                                kernels::matmul_q8_0(&mut st.v, v_w, xin, s.n_embd, hkv * hd, n_tok)?;
++                                matw(&mut st.v, v_w, xin, &st.attn_xq, s.n_embd, hkv * hd, n_tok)?;
+                                 if let Some(ab) = &l.attn_bias {
+                                     kernels::add_bias_rows(&mut st.v, &ab.v, hkv * hd, n_tok)?;
+                                 }
+@@ -6184,7 +6299,7 @@ mod real {
+                         if let Some(kn) = k_norm {
+                             kernels::gqa_head_rms_norm(&mut st.k, Some(kn), n_tok * hkv, hd, eps)?;
+                         }
+-                        if gm.is_some() && l.ink.is_none() && l.attn_gate.is_none() && q_norm.is_some() {
++                        if gm.is_some() && l.ink.is_none() && attn_gate.is_none() && q_norm.is_some() {
+                             // gemma: v gets a weightless per-head rms norm.
+                             // laguna also has per-layer geom but does NOT
+                             // do this (attn_gate marks it), and neither does
+@@ -6271,7 +6386,7 @@ mod real {
+                         // inkling at muP 1/head_dim
+                         let scale = if l.ink.is_some() {
+                             1.0 / hd as f32
+-                        } else if gm.is_some() && l.attn_gate.is_none() && q_norm.is_some() {
++                        } else if gm.is_some() && attn_gate.is_none() && q_norm.is_some() {
+                             // gemma only, and the reason is the qk-norm: q is
+                             // already per-head normalized, so the scores need
+                             // no 1/sqrt(head_dim). Keyed on that norm rather
+@@ -6317,8 +6432,8 @@ mod real {
+                         // laguna: per-head output gate. g_proj gives one
+                         // logit per (token, head); softplus of it scales
+                         // the whole head row before the output projection.
+-                        if let Some(gw) = &l.attn_gate {
+-                            kernels::matmul_q8_0(&mut st.attn_gate_buf, gw, xin, s.n_embd, nh_q, n_tok)?;
++                        if let Some(gw) = attn_gate {
++                            matw(&mut st.attn_gate_buf, gw, xin, &st.attn_xq, s.n_embd, nh_q, n_tok)?;
+                             if il == 0 && std::env::var_os("PULSAR_L2_TRACE").is_some() {
+                                 kernels::sync()?;
+                                 let g = st.attn_gate_buf.read_f32((n_tok * nh_q) as usize)?;
+@@ -6337,12 +6452,20 @@ mod real {
+                             }
+                         }
+ 
++                        if attn_output.is_kq() {
++                            kernels::quantize_q8_k(&mut st.attn_heads_xq, &st.heads, nh_q * hd, n_tok)?;
++                        }
+                         // output projection on the attn card, hop back,
+                         // restore the primary (mirrors the Mla path)
+                         if self.attn_dev.is_some() {
+-                            kernels::matmul_q8_0(&mut st.attn_out_a, attn_output_w, &st.heads, nh_q * hd, s.n_embd, n_tok)?;
++                            matw(&mut st.attn_out_a, attn_output, &st.heads, &st.attn_heads_xq, nh_q * hd, s.n_embd, n_tok)?;
+                             kernels::copy_across(&mut st.attn_out, &st.attn_out_a, (n_tok * s.n_embd) as usize * 4)?;
+                             kernels::set_device(primary)?;
++                        } else {
++                            matw(&mut st.attn_out, attn_output, &st.heads, &st.attn_heads_xq, nh_q * hd, s.n_embd, n_tok)?;
++                        }
++                        if let Some(ab) = &l.attn_bias {
++                            kernels::add_bias_rows(&mut st.attn_out, &ab.out, s.n_embd, n_tok)?;
+                         }
+                     }
+                     Attn::Mla { q_a, q_a_norm, q_b, kv_a_mqa, kv_a_norm, k_b, v_b, indexer } => {
+@@ -6480,13 +6603,6 @@ mod real {
+                         } else {
+                             kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &sc.heads, s.heads_dim(), s.n_embd, n_tok)?;
+                         }
+-                        mla_attn_done = true;
+-                    }
+-                }
+-                if self.attn_dev.is_none() && !mla_attn_done {
+-                    kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &st.heads, heads_dim, s.n_embd, n_tok)?;
+-                    if let Some(ab) = &l.attn_bias {
+-                        kernels::add_bias_rows(&mut st.attn_out, &ab.out, s.n_embd, n_tok)?;
+                     }
+                 }
+                 if let Some(gw) = &l.gemma {
+-- 
+2.50.1.windows.1
+

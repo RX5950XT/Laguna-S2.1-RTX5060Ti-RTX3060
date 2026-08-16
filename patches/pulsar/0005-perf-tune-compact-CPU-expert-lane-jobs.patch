@@ -1,0 +1,326 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RX5950XT <123271969+RX5950XT@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 12:55:20 +0800
+Subject: [PATCH 5/6] perf: tune compact CPU expert lane jobs
+
+
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index d286752..65667f9 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -1964,15 +1964,8 @@ mod real {
+         }
+ 
+         impl Pool {
+-            pub fn from_env() -> Option<Pool> {
+-                let v = std::env::var("PULSAR_CPU").ok()?;
+-                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+-                let threads = match v.as_str() {
+-                    "" | "0" | "off" => return None,
+-                    // physical cores minus main + fetcher headroom
+-                    "1" | "on" => (cores / 2).saturating_sub(2).max(1),
+-                    n => n.parse().ok()?,
+-                };
++            fn new(threads: usize) -> Pool {
++                assert!(threads > 0, "CPU lane needs at least one worker");
+                 let (tx, rx) = std::sync::mpsc::channel::<Job>();
+                 let (done_tx, done_rx) = std::sync::mpsc::channel();
+                 let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+@@ -1988,7 +1981,19 @@ mod real {
+                         let _ = done_tx.send(());
+                     });
+                 }
+-                Some(Pool { tx, done_rx, threads })
++                Pool { tx, done_rx, threads }
++            }
++
++            pub fn from_env() -> Option<Pool> {
++                let v = std::env::var("PULSAR_CPU").ok()?;
++                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
++                let threads = match v.as_str() {
++                    "" | "0" | "off" => return None,
++                    // physical cores minus main + fetcher headroom
++                    "1" | "on" => (cores / 2).saturating_sub(2).max(1),
++                    n => n.parse().ok()?,
++                };
++                Some(Pool::new(threads))
+             }
+ 
+             pub fn submit(&self, jobs: Vec<Job>) -> usize {
+@@ -2108,12 +2113,14 @@ mod real {
+                 let xq_ptr = SendPtr(self.xqs.as_ptr() as *const u8);
+                 let mut jobs: Vec<Job> = Vec::new();
+                 let mut mid_base = 0usize;
++                let active = self.pairs.iter().filter(|pairs| !pairs.is_empty()).count();
++                let chunk_rows = stage_a_chunk_rows(nf, active, pool.threads);
+                 for (ci, pairs) in self.pairs.iter().enumerate() {
+                     let [gp, up_, _] = self.ptrs[ci];
+                     let mid = SendMut(unsafe { self.mids.as_mut_ptr().add(mid_base * nf) });
+                     mid_base += pairs.len();
+-                    for lo in (0..nf).step_by(256) {
+-                        let hi = (lo + 256).min(nf);
++                    for lo in (0..nf).step_by(chunk_rows) {
++                        let hi = (lo + chunk_rows).min(nf);
+                         let pairs = pairs.clone();
+                         jobs.push(Box::new(move || unsafe {
+                             for j in lo..hi {
+@@ -2177,6 +2184,129 @@ mod real {
+             }
+         }
+ 
++        fn stage_a_chunk_rows(rows: usize, active_experts: usize, threads: usize) -> usize {
++            let jobs_per_expert = threads.div_ceil(active_experts.max(1));
++            rows.div_ceil(jobs_per_expert).clamp(64, 256).min(rows)
++        }
++
++        #[cfg(test)]
++        mod tests {
++            use super::{dot, glu, stage_a_chunk_rows, Lane, Pool};
++
++            #[test]
++            fn stage_a_fills_pool_without_oversplitting_multi_expert_work() {
++                assert_eq!(stage_a_chunk_rows(1024, 1, 6), 171);
++                assert_eq!(stage_a_chunk_rows(1024, 2, 6), 256);
++                assert_eq!(stage_a_chunk_rows(1024, 4, 6), 256);
++            }
++
++            fn q4_matrix(rows: usize, cols: usize, seed: &mut u64) -> Vec<u8> {
++                let row_bytes = cols / 256 * quant::cpu_dot::Q4_K_BLOCK_BYTES;
++                let mut data = vec![0u8; rows * row_bytes];
++                for chunk in data.chunks_exact_mut(8) {
++                    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
++                    chunk.copy_from_slice(&seed.to_le_bytes());
++                }
++                for row in data.chunks_exact_mut(row_bytes) {
++                    for block in row.chunks_exact_mut(quant::cpu_dot::Q4_K_BLOCK_BYTES) {
++                        block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
++                        block[2..4].fill(0);
++                    }
++                }
++                data
++            }
++
++            #[test]
++            fn lane_matches_serial_q4_k_expert() {
++                let (ne, nf) = (256usize, 256usize);
++                let (grb, drb) = (
++                    ne / 256 * quant::cpu_dot::Q4_K_BLOCK_BYTES,
++                    nf / 256 * quant::cpu_dot::Q4_K_BLOCK_BYTES,
++                );
++                let mut seed = 7u64;
++                let gate = q4_matrix(nf, ne, &mut seed);
++                let up = q4_matrix(nf, ne, &mut seed);
++                let down = q4_matrix(ne, nf, &mut seed);
++                let normed = (0..ne)
++                    .map(|i| ((i % 31) as f32 - 15.0) / 15.0)
++                    .collect::<Vec<_>>();
++                let weight = 0.375f32;
++                let pool = Pool::new(2);
++                let mut lane = Lane::new(
++                    kernels::QUANT_Q4_K, kernels::QUANT_Q4_K, grb, drb, ne, nf, 0,
++                );
++                lane.add(7, gate.as_ptr(), up.as_ptr(), down.as_ptr());
++                let jobs = lane.submit_a(&pool, &[7], 1, &normed, &[weight], 1);
++                pool.wait(jobs);
++                let actual = lane.finish(&pool, 1);
++
++                let xq = quant::cpu_dot::quantize_row_q8_k(&normed);
++                let mid = (0..nf)
++                    .map(|j| {
++                        let g = dot(kernels::QUANT_Q4_K, &gate[j * grb..(j + 1) * grb], &xq, ne);
++                        let u = dot(kernels::QUANT_Q4_K, &up[j * grb..(j + 1) * grb], &xq, ne);
++                        glu(g, u, 0) * weight
++                    })
++                    .collect::<Vec<_>>();
++                let midq = quant::cpu_dot::quantize_row_q8_k(&mid);
++                let expected = (0..ne)
++                    .map(|r| dot(kernels::QUANT_Q4_K, &down[r * drb..(r + 1) * drb], &midq, nf))
++                    .collect::<Vec<_>>();
++                assert_eq!(actual, expected);
++            }
++
++            #[test]
++            #[ignore = "manual Ryzen/APEX compact microbenchmark"]
++            fn apex_compact_lane_benchmark() {
++                let read = |name: &str, default| {
++                    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
++                };
++                let threads = read("PULSAR_CPU_BENCH_THREADS", 6usize);
++                let experts = read("PULSAR_CPU_BENCH_EXPERTS", 2usize);
++                let iterations = read("PULSAR_CPU_BENCH_ITERS", 20usize);
++                let (ne, nf) = (3072usize, 1024usize);
++                let (grb, drb) = (
++                    ne / 256 * quant::cpu_dot::Q4_K_BLOCK_BYTES,
++                    nf / 256 * quant::cpu_dot::Q4_K_BLOCK_BYTES,
++                );
++                let mut seed = 11u64;
++                let weights = (0..experts)
++                    .map(|_| (
++                        q4_matrix(nf, ne, &mut seed),
++                        q4_matrix(nf, ne, &mut seed),
++                        q4_matrix(ne, nf, &mut seed),
++                    ))
++                    .collect::<Vec<_>>();
++                let normed = (0..ne)
++                    .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
++                    .collect::<Vec<_>>();
++                let selected = (0..experts as i32).collect::<Vec<_>>();
++                let router = vec![1.0 / experts as f32; experts];
++                let pool = Pool::new(threads);
++                let run = || {
++                    let mut lane = Lane::new(
++                        kernels::QUANT_Q4_K, kernels::QUANT_Q4_K, grb, drb, ne, nf, 0,
++                    );
++                    for (e, (gate, up, down)) in weights.iter().enumerate() {
++                        lane.add(e as i32, gate.as_ptr(), up.as_ptr(), down.as_ptr());
++                    }
++                    let jobs = lane.submit_a(&pool, &selected, experts, &normed, &router, 1);
++                    pool.wait(jobs);
++                    std::hint::black_box(lane.finish(&pool, 1));
++                };
++                for _ in 0..3 { run(); }
++                let start = std::time::Instant::now();
++                for _ in 0..iterations { run(); }
++                let elapsed = start.elapsed().as_secs_f64();
++                let bytes_per_expert = 2 * nf * grb + ne * drb;
++                eprintln!(
++                    "apex-lane: threads={threads} experts={experts} iterations={iterations} {:.3} ms/layer {:.2} GB/s",
++                    elapsed * 1e3 / iterations as f64,
++                    (bytes_per_expert * experts * iterations) as f64 / 1e9 / elapsed,
++                );
++            }
++        }
++
+         /// quants the lane can compute; extend together with dot()
+         pub fn supported(quant: u32) -> bool {
+             [
+diff --git a/crates/quant/src/bin/cpu-tier-bench.rs b/crates/quant/src/bin/cpu-tier-bench.rs
+index b91425a..b02c633 100644
+--- a/crates/quant/src/bin/cpu-tier-bench.rs
++++ b/crates/quant/src/bin/cpu-tier-bench.rs
+@@ -3,9 +3,50 @@
+ //! RAM like real host-cache hits. Target: >40GB/s aggregate on the
+ //! 9900X (PCIe H2D measures 28.7GB/s; below that the tier loses).
+ //!
+-//!   cpu-tier-bench [threads] [gb] [passes]
++//!   cpu-tier-bench [threads] [gb] [passes] [iq2_xxs|q4_k] [n_cols]
+ 
+-use quant::cpu_dot::{quantize_row_q8_k, vec_dot_iq2_xxs_q8_k, IQ2_XXS_BLOCK_BYTES, QK_K};
++use quant::cpu_dot::{
++    quantize_row_q8_k, vec_dot_iq2_xxs_q8_k, vec_dot_q4_k_q8_k, IQ2_XXS_BLOCK_BYTES,
++    Q4_K_BLOCK_BYTES, QK_K,
++};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Format {
++    Iq2Xxs,
++    Q4K,
++}
++
++impl Format {
++    fn parse(value: Option<String>) -> Self {
++        match value.as_deref() {
++            Some("q4_k") | Some("q4") => Self::Q4K,
++            _ => Self::Iq2Xxs,
++        }
++    }
++
++    fn block_bytes(self) -> usize {
++        match self {
++            Self::Iq2Xxs => IQ2_XXS_BLOCK_BYTES,
++            Self::Q4K => Q4_K_BLOCK_BYTES,
++        }
++    }
++
++    fn dot(self, row: &[u8], xq: &quant::cpu_dot::Q8KRow, n_cols: usize) -> f32 {
++        match self {
++            Self::Iq2Xxs => vec_dot_iq2_xxs_q8_k(row, xq, n_cols),
++            Self::Q4K => vec_dot_q4_k_q8_k(row, xq, n_cols),
++        }
++    }
++
++    fn sanitize_row(self, row: &mut [u8]) {
++        for block in row.chunks_exact_mut(self.block_bytes()) {
++            block[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
++            if self == Self::Q4K {
++                block[2..4].fill(0);
++            }
++        }
++    }
++}
+ 
+ fn main() {
+     let mut args = std::env::args().skip(1);
+@@ -14,15 +55,17 @@ fn main() {
+     );
+     let gb: f64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(2.0);
+     let passes: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1);
++    let format = Format::parse(args.next());
+ 
+-    // GLM-shaped rows: n_embd 5120 columns
+-    let n_cols = 5120usize;
+-    let row_bytes = n_cols / QK_K * IQ2_XXS_BLOCK_BYTES;
++    // GLM-shaped default; pass 3072 for Laguna APEX compact.
++    let n_cols = args.next().and_then(|a| a.parse().ok()).unwrap_or(5120usize);
++    assert!(n_cols.is_multiple_of(QK_K), "n_cols must be divisible by {QK_K}");
++    let row_bytes = n_cols / QK_K * format.block_bytes();
+     let n_rows = ((gb * 1e9) as usize / row_bytes).max(threads);
+     let total_bytes = n_rows * row_bytes;
+     eprintln!(
+-        "cpu-tier-bench: {} rows x {} cols ({:.2} GB working set), {} threads",
+-        n_rows, n_cols, total_bytes as f64 / 1e9, threads
++        "cpu-tier-bench: {:?}, {} rows x {} cols ({:.2} GB working set), {} threads",
++        format, n_rows, n_cols, total_bytes as f64 / 1e9, threads
+     );
+ 
+     // decode never validates encoder invariants, so random bytes are a
+@@ -33,6 +76,9 @@ fn main() {
+         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+         b.copy_from_slice(&state.to_le_bytes());
+     }
++    for row in weights.chunks_exact_mut(row_bytes) {
++        format.sanitize_row(row);
++    }
+     // keep stored 4-bit scales small so f16 d stays sane: not needed for
+     // speed, but keeps outputs finite for the checksum
+     let act: Vec<f32> = (0..n_cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+@@ -56,7 +102,7 @@ fn main() {
+                 for _ in 0..passes {
+                     for r in lo..hi {
+                         let row = &weights[r * row_bytes..(r + 1) * row_bytes];
+-                        acc += vec_dot_iq2_xxs_q8_k(row, xq, n_cols) as f64;
++                        acc += format.dot(row, xq, n_cols) as f64;
+                     }
+                 }
+                 acc
+@@ -77,3 +123,27 @@ fn main() {
+         sink
+     );
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::Format;
++
++    #[test]
++    fn apex_q4_row_geometry_matches_gguf() {
++        assert_eq!(3072 / 256 * Format::Q4K.block_bytes(), 1728);
++    }
++
++    #[test]
++    fn synthetic_scales_stay_finite() {
++        for format in [Format::Iq2Xxs, Format::Q4K] {
++            let mut row = vec![0xff; format.block_bytes() * 2];
++            format.sanitize_row(&mut row);
++            for block in row.chunks_exact(format.block_bytes()) {
++                assert_eq!(&block[..2], &0x3c00u16.to_le_bytes());
++                if format == Format::Q4K {
++                    assert_eq!(&block[2..4], &[0, 0]);
++                }
++            }
++        }
++    }
++}
+-- 
+2.50.1.windows.1
+

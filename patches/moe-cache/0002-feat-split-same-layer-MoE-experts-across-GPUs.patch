@@ -1,0 +1,1273 @@
+From e544d4353fdffb5ef163ca9cfe929226293fd182 Mon Sep 17 00:00:00 2001
+From: RX5950XT <123271969+RX5950XT@users.noreply.github.com>
+Date: Fri, 14 Aug 2026 12:59:48 +0800
+Subject: [PATCH] feat: split same-layer MoE experts across GPUs
+
+---
+ ggml/src/ggml-cuda/moe-cache.cu | 798 +++++++++++++++++++++++++-------
+ tests/test-moe-cache.cpp        |  97 ++++
+ 2 files changed, 718 insertions(+), 177 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-cache.cu b/ggml/src/ggml-cuda/moe-cache.cu
+index b056213d..61429327 100644
+--- a/ggml/src/ggml-cuda/moe-cache.cu
++++ b/ggml/src/ggml-cuda/moe-cache.cu
+@@ -53,6 +53,9 @@ static constexpr int    moe_cache_batch_max                   = 8;
+ static constexpr int    moe_cache_pool_slots_min              = 64;
+ static constexpr size_t moe_cache_slab_bytes_auto_min         = 1ull << 30;
+ static constexpr int    moe_cache_node_rows_max               = 64;
++static constexpr int    moe_cache_max_lanes                   = 8;
++static constexpr int    moe_cache_slot_lane_shift             = 20;
++static constexpr int32_t moe_cache_slot_mask                  = (1 << 20) - 1;
+ static constexpr size_t moe_cache_overlap_bytes_per_token     = 8u << 20;
+ 
+ enum class moe_cache_slot_state : uint8_t {
+@@ -158,6 +161,7 @@ struct moe_cache_config {
+     bool force_dedicated_mmv = false;
+     int overlap_cpu_rows = -1;
+     bool overlap_cpu_rows_explicit = false;
++    bool split_experts = true;
+     std::string fail_stage;
+ };
+ 
+@@ -272,6 +276,10 @@ struct moe_cache_node {
+     moe_cache_device * device = nullptr;
+     moe_cache_pool * pool = nullptr;
+     int pool_index = -1;
++    moe_cache_device * devices[moe_cache_max_lanes] = {};
++    moe_cache_pool * pools[moe_cache_max_lanes] = {};
++    int pool_indices[moe_cache_max_lanes] = {};
++    int n_lanes = 0;
+     const void * host_base = nullptr;
+     const void * host_base2 = nullptr;
+     size_t expert_size = 0;
+@@ -281,8 +289,12 @@ struct moe_cache_node {
+     int64_t n_tokens = 0;
+     int wtype = -1;
+     std::unique_lock<std::mutex> dispatch_lock;
++    std::unique_lock<std::mutex> dispatch_locks[moe_cache_max_lanes];
+     moe_cache_pin pins[2 * moe_cache_node_rows_max];
+     int n_pins = 0;
++    int lane_dst[moe_cache_max_lanes][moe_cache_node_rows_max] = {};
++    int lane_n[moe_cache_max_lanes] = {};
++    bool lane_dispatched[moe_cache_max_lanes] = {};
+     bool planned = false;
+     bool dispatched = false;
+ };
+@@ -305,6 +317,48 @@ struct moe_cache_scope_frame {
+ static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
+ static thread_local int g_session_suppressed = 0;
+ 
++static int moe_cache_expert_lane(int32_t expert, int n_lanes) {
++    if (n_lanes <= 1) {
++        return 0;
++    }
++    return (int)((uint32_t)expert % (uint32_t)n_lanes);
++}
++
++static int32_t moe_cache_pack_slot(int lane, int slot) {
++    return (int32_t)(((uint32_t)lane << moe_cache_slot_lane_shift) |
++                     ((uint32_t)slot & (uint32_t)moe_cache_slot_mask));
++}
++
++static int moe_cache_unpack_lane(int32_t packed) {
++    return (int)((uint32_t)packed >> moe_cache_slot_lane_shift);
++}
++
++static int moe_cache_unpack_slot(int32_t packed) {
++    return (int)((uint32_t)packed & (uint32_t)moe_cache_slot_mask);
++}
++
++static int64_t moe_cache_lane_entries(int64_t n_expert, int lane, int n_lanes) {
++    if (n_lanes <= 1 || n_expert <= 0) {
++        return n_expert;
++    }
++    int64_t count = 0;
++    for (int64_t expert = 0; expert < n_expert; expert++) {
++        if (moe_cache_expert_lane((int32_t)expert, n_lanes) == lane) {
++            count++;
++        }
++    }
++    return count;
++}
++
++static void moe_cache_node_set_primary(moe_cache_node & node) {
++    if (node.n_lanes <= 0) {
++        return;
++    }
++    node.device = node.devices[0];
++    node.pool = node.pools[0];
++    node.pool_index = node.pool_indices[0];
++}
++
+ static size_t moe_cache_trim_session(
+         moe_cache_session & session, int physical_device);
+ 
+@@ -599,6 +653,9 @@ static moe_cache_config moe_cache_read_config() {
+         config.overlap_cpu_rows = (int)value;
+         config.overlap_cpu_rows_explicit = true;
+     }
++    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS", 0, 1, value)) {
++        config.split_experts = value != 0;
++    }
+     moe_cache_apply_mode_defaults(config);
+     config.min_compute_capability = moe_cache_min_compute_capability(config.automatic);
+     if (const char * fail = getenv("GGML_CUDA_MOE_CACHE_FAIL")) {
+@@ -1388,7 +1445,7 @@ static void moe_cache_build_pending(
+ static int moe_cache_discover_pool(
+         moe_cache_session & session, moe_cache_device & device,
+         const void * host_base, size_t tensor_size, size_t expert_size,
+-        int wtype, int64_t n_expert) {
++        int wtype, int64_t n_expert, int64_t counted_experts = -1) {
+     int pool = moe_cache_find_pool(device, expert_size, wtype);
+     if (pool >= 0 && !device.pools[pool]->covers_all_entries) {
+         return pool;
+@@ -1417,7 +1474,8 @@ static int moe_cache_discover_pool(
+         if (shape->n_tensors == 0 && shape->pool < 0) {
+             shape->finished = false;
+         }
+-        const uint64_t entries = (uint64_t)n_expert;
++        const int64_t counted = counted_experts >= 0 ? counted_experts : n_expert;
++        const uint64_t entries = counted > 0 ? (uint64_t)counted : 0;
+         shape->n_entries = entries <= UINT64_MAX - shape->n_entries
+             ? shape->n_entries + entries : UINT64_MAX;
+         shape->n_tensors++;
+@@ -1482,7 +1540,7 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
+             std::to_string(session.config.readmit_after) + "-replace"
+         : "1-complete/" + std::to_string(session.config.admit_after) +
+             "-partial/" + std::to_string(session.config.readmit_after) + "-replace";
+-    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s cpu-overlap=%s fills=%s\n",
++    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s cpu-overlap=%s fills=%s split-experts=%s\n",
+             session.config.automatic ? "auto" : "on",
+             session.devices.size(), budget.c_str(),
+             session.config.reserve_mb,
+@@ -1491,7 +1549,8 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
+             session.config.max_batch,
+             admission.c_str(),
+             overlap_cpu_rows.c_str(),
+-            session.config.serial_fill ? "serial" : "parallel");
++            session.config.serial_fill ? "serial" : "parallel",
++            session.config.split_experts ? "on" : "off");
+ }
+ 
+ static void * moe_cache_session_create(
+@@ -1867,6 +1926,10 @@ static void * moe_cache_begin(
+     moe_cache_device * selected = nullptr;
+     int pool_index = -1;
+     moe_cache_pool * pool = nullptr;
++    moe_cache_device * split_devices[moe_cache_max_lanes] = {};
++    moe_cache_pool * split_pools[moe_cache_max_lanes] = {};
++    int split_pool_indices[moe_cache_max_lanes] = {};
++    int split_n_lanes = 0;
+     {
+         std::unique_lock<std::mutex> lock(session->mu);
+         if (session->stopping) {
+@@ -1935,7 +1998,81 @@ static void * moe_cache_begin(
+             return available >= minimum_pool ? available : 0;
+         };
+ 
++        if (session->config.split_experts && has_layer && eligible_devices >= 2) {
++            moe_cache_device * candidates[moe_cache_max_lanes] = {};
++            int n_candidates = 0;
++            for (const auto & device_ptr : session->devices) {
++                if (n_candidates >= moe_cache_max_lanes) {
++                    break;
++                }
++                if (route_weight(*device_ptr) == 0) {
++                    continue;
++                }
++                candidates[n_candidates++] = device_ptr.get();
++            }
++            if (n_candidates >= 2) {
++                std::sort(candidates, candidates + n_candidates,
++                        [](const moe_cache_device * lhs, const moe_cache_device * rhs) {
++                            return lhs->physical < rhs->physical;
++                        });
++                bool all_ready = true;
++                for (int lane = 0; lane < n_candidates; lane++) {
++                    int64_t counted = moe_cache_lane_entries(
++                            n_expert, lane, n_candidates);
++                    if (counted < moe_cache_pool_slots_min) {
++                        counted = n_expert < moe_cache_pool_slots_min
++                            ? n_expert : moe_cache_pool_slots_min;
++                    }
++                    int discovered = -1;
++                    try {
++                        discovered = moe_cache_discover_pool(
++                                *session, *candidates[lane], host_base, tensor_size,
++                                expert_size, wtype, n_expert, counted);
++                    } catch (...) {
++                        all_ready = false;
++                        break;
++                    }
++                    if (discovered < 0 ||
++                        discovered >= (int)candidates[lane]->pools.size() ||
++                        !candidates[lane]->pools[discovered]->slab) {
++                        all_ready = false;
++                        break;
++                    }
++                    const size_t scratch = moe_cache_scratch_total(
++                            candidates[lane]->scratch_reserve, &scratch_requirements);
++                    if (scratch >= candidates[lane]->budget_limit ||
++                        minimum_pool > candidates[lane]->budget_limit - scratch) {
++                        all_ready = false;
++                        break;
++                    }
++                    split_devices[lane] = candidates[lane];
++                    split_pools[lane] = candidates[lane]->pools[discovered].get();
++                    split_pool_indices[lane] = discovered;
++                }
++                if (all_ready) {
++                    split_n_lanes = n_candidates;
++                    for (int lane = 0; lane < split_n_lanes; lane++) {
++                        split_devices[lane]->scratch_reserve.input = std::max(
++                                split_devices[lane]->scratch_reserve.input,
++                                scratch_requirements.input);
++                        split_devices[lane]->scratch_reserve.q8 = std::max(
++                                split_devices[lane]->scratch_reserve.q8,
++                                scratch_requirements.q8);
++                        split_devices[lane]->scratch_reserve.out = std::max(
++                                split_devices[lane]->scratch_reserve.out,
++                                scratch_requirements.out);
++                    }
++                    selected = split_devices[0];
++                    pool = split_pools[0];
++                    pool_index = split_pool_indices[0];
++                } else {
++                    split_n_lanes = 0;
++                }
++            }
++        }
++
+         bool tensor_override = !has_layer;
++        if (split_n_lanes < 2) {
+         auto find_routed_device = [&](int physical) -> moe_cache_device * {
+             for (const auto & device_ptr : session->devices) {
+                 if (device_ptr->physical == physical) {
+@@ -1957,7 +2094,7 @@ static void * moe_cache_begin(
+             }
+         }
+ 
+-        if (!selected && has_layer) {
++        if (split_n_lanes < 2 && !selected && has_layer) {
+             auto layer_route = session->layer_devices.find(layer);
+             if (layer_route != session->layer_devices.end()) {
+                 selected = find_routed_device(layer_route->second);
+@@ -2072,6 +2209,7 @@ static void * moe_cache_begin(
+             return nullptr;
+         }
+         pool = selected->pools[pool_index].get();
++        }
+         moe_cache_session::active_source * source = nullptr;
+         try {
+             source = &session->active_sources[host_base];
+@@ -2083,12 +2221,7 @@ static void * moe_cache_begin(
+         session->active_nodes++;
+     }
+ 
+-    moe_cache_device & device = *selected;
+-    std::unique_lock<std::mutex> dispatch_lock;
+-    try {
+-        dispatch_lock = std::unique_lock<std::mutex>(
+-                device.dispatch_mu, std::try_to_lock);
+-    } catch (...) {
++    auto release_begin_source = [&] {
+         std::lock_guard<std::mutex> lock(session->mu);
+         auto source = session->active_sources.find(host_base);
+         if (source != session->active_sources.end() && --source->second.references == 0) {
+@@ -2096,28 +2229,38 @@ static void * moe_cache_begin(
+         }
+         session->active_nodes--;
+         session->idle_cv.notify_all();
++    };
++
++    moe_cache_device & device = *selected;
++    std::unique_lock<std::mutex> dispatch_lock;
++    std::unique_lock<std::mutex> split_locks[moe_cache_max_lanes];
++    try {
++        if (split_n_lanes >= 2) {
++            for (int lane = 0; lane < split_n_lanes; lane++) {
++                split_locks[lane] = std::unique_lock<std::mutex>(
++                        split_devices[lane]->dispatch_mu, std::try_to_lock);
++                if (!split_locks[lane].owns_lock() ||
++                    split_devices[lane]->dead.load()) {
++                    release_begin_source();
++                    return nullptr;
++                }
++            }
++        } else {
++            dispatch_lock = std::unique_lock<std::mutex>(
++                    device.dispatch_mu, std::try_to_lock);
++        }
++    } catch (...) {
++        release_begin_source();
+         return nullptr;
+     }
+-    if (!dispatch_lock.owns_lock() || device.dead.load()) {
+-        std::lock_guard<std::mutex> lock(session->mu);
+-        auto source = session->active_sources.find(host_base);
+-        if (source != session->active_sources.end() && --source->second.references == 0) {
+-            session->active_sources.erase(source);
+-        }
+-        session->active_nodes--;
+-        session->idle_cv.notify_all();
++    if (split_n_lanes < 2 && (!dispatch_lock.owns_lock() || device.dead.load())) {
++        release_begin_source();
+         return nullptr;
+     }
+ 
+     std::unique_ptr<moe_cache_node> node(new (std::nothrow) moe_cache_node());
+     if (!node) {
+-        std::lock_guard<std::mutex> lock(session->mu);
+-        auto source = session->active_sources.find(host_base);
+-        if (source != session->active_sources.end() && --source->second.references == 0) {
+-            session->active_sources.erase(source);
+-        }
+-        session->active_nodes--;
+-        session->idle_cv.notify_all();
++        release_begin_source();
+         return nullptr;
+     }
+     node->session = session;
+@@ -2131,7 +2274,22 @@ static void * moe_cache_begin(
+     node->n_expert = n_expert;
+     node->n_tokens = n_tokens;
+     node->wtype = wtype;
+-    node->dispatch_lock = std::move(dispatch_lock);
++    if (split_n_lanes >= 2) {
++        node->n_lanes = split_n_lanes;
++        for (int lane = 0; lane < split_n_lanes; lane++) {
++            node->devices[lane] = split_devices[lane];
++            node->pools[lane] = split_pools[lane];
++            node->pool_indices[lane] = split_pool_indices[lane];
++            node->dispatch_locks[lane] = std::move(split_locks[lane]);
++        }
++        moe_cache_node_set_primary(*node);
++    } else {
++        node->n_lanes = 1;
++        node->devices[0] = &device;
++        node->pools[0] = pool;
++        node->pool_indices[0] = pool_index;
++        node->dispatch_lock = std::move(dispatch_lock);
++    }
+     return node.release();
+ }
+ 
+@@ -2260,6 +2418,7 @@ static int moe_cache_plan(
+     }
+ 
+     moe_cache_session & session = *node->session;
++    const int n_lanes = node->n_lanes > 0 ? node->n_lanes : 1;
+     moe_cache_device & device = *node->device;
+     moe_cache_pool & pool = *node->pool;
+     int hits = 0;
+@@ -2272,26 +2431,68 @@ static int moe_cache_plan(
+     }
+     for (int index = 0; index < n_ids; index++) {
+         const int32_t expert = ids[index];
+-        if (expert < 0 || expert >= node->n_expert || device.dead.load()) {
++        if (expert < 0 || expert >= node->n_expert) {
+             continue;
+         }
+ 
+-        const int slot_index = moe_cache_lookup_or_queue_locked(
+-                session, device, pool, node->pool_index,
+-                node->host_base, expert, node->expert_size,
+-                inserts_left, wake_worker);
+-        if (slot_index < 0) {
+-            device.misses++;
+-            continue;
++        int hit_lane = -1;
++        int slot_index = -1;
++        if (n_lanes > 1) {
++            for (int lane = 0; lane < n_lanes; lane++) {
++                moe_cache_device * lane_device = node->devices[lane];
++                moe_cache_pool * lane_pool = node->pools[lane];
++                if (!lane_device || !lane_pool || lane_device->dead.load()) {
++                    continue;
++                }
++                const auto found = lane_pool->map.find({node->host_base, expert});
++                if (found != lane_pool->map.end() &&
++                    lane_pool->slots[found->second].state == moe_cache_slot_state::valid) {
++                    hit_lane = lane;
++                    slot_index = found->second;
++                    break;
++                }
++            }
++            if (slot_index < 0) {
++                const int target = moe_cache_expert_lane(expert, n_lanes);
++                moe_cache_device * lane_device = node->devices[target];
++                moe_cache_pool * lane_pool = node->pools[target];
++                if (lane_device && lane_pool && !lane_device->dead.load()) {
++                    (void)moe_cache_lookup_or_queue_locked(
++                            session, *lane_device, *lane_pool, node->pool_indices[target],
++                            node->host_base, expert, node->expert_size,
++                            inserts_left, wake_worker);
++                    lane_device->misses++;
++                } else {
++                    device.misses++;
++                }
++                continue;
++            }
++        } else {
++            if (device.dead.load()) {
++                continue;
++            }
++            slot_index = moe_cache_lookup_or_queue_locked(
++                    session, device, pool, node->pool_index,
++                    node->host_base, expert, node->expert_size,
++                    inserts_left, wake_worker);
++            if (slot_index < 0) {
++                device.misses++;
++                continue;
++            }
++            hit_lane = 0;
+         }
+ 
+-        moe_cache_slot & slot = pool.slots[slot_index];
++        moe_cache_device & hit_device =
++            n_lanes > 1 ? *node->devices[hit_lane] : device;
++        moe_cache_pool & hit_pool =
++            n_lanes > 1 ? *node->pools[hit_lane] : pool;
++        moe_cache_slot & slot = hit_pool.slots[slot_index];
+         slot.readers++;
+-        moe_cache_lru_remove(pool, slot_index);
+-        moe_cache_lru_push_back(pool, slot_index);
+-        node->pins[node->n_pins++] = {&pool, slot_index};
+-        slot_indices[index] = slot_index;
+-        device.hits++;
++        moe_cache_lru_remove(hit_pool, slot_index);
++        moe_cache_lru_push_back(hit_pool, slot_index);
++        node->pins[node->n_pins++] = {&hit_pool, slot_index};
++        slot_indices[index] = moe_cache_pack_slot(hit_lane, slot_index);
++        hit_device.hits++;
+         hits++;
+     }
+     if (hits == n_ids) {
+@@ -2301,18 +2502,22 @@ static int moe_cache_plan(
+                 continue;
+             }
+             const moe_cache_pin & pin = node->pins[node->n_pins - 1];
+-            if (pin.slot != slot_indices[index]) {
++            if (pin.slot != moe_cache_unpack_slot(slot_indices[index])) {
+                 continue;
+             }
+             moe_cache_slot & slot = pin.pool->slots[pin.slot];
+             if (slot.readers > 0) {
+                 slot.readers--;
+             }
++            const int lane = moe_cache_unpack_lane(slot_indices[index]);
++            moe_cache_device & overlap_device =
++                n_lanes > 1 && lane >= 0 && lane < n_lanes && node->devices[lane]
++                    ? *node->devices[lane] : device;
+             node->n_pins--;
+             slot_indices[index] = -1;
+             hits--;
+             rows--;
+-            device.overlap_rows++;
++            overlap_device.overlap_rows++;
+         }
+     }
+     device.nodes++;
+@@ -2328,12 +2533,14 @@ static int moe_cache_dispatch_internal(
+         const int32_t * slot_indices, const float * const * act_rows,
+         moe_cache_pool * gate_pool, const int32_t * gate_slot_indices,
+         int glu_op, float up_min, float up_max,
+-        float gate_min, float gate_max) {
++        float gate_min, float gate_max,
++        moe_cache_device * override_device = nullptr,
++        moe_cache_pool * override_pool = nullptr) {
+     moe_cache_node * node = (moe_cache_node *)opaque;
+     const bool fused = gate_pool != nullptr;
+-    if (!node || !node->planned || node->dispatched || n_hits <= 0 ||
++    if (!node || !node->planned || n_hits <= 0 ||
+         n_hits > moe_cache_node_rows_max ||
+-        n_hits * (fused ? 2 : 1) != node->n_pins ||
++        n_hits * (fused ? 2 : 1) > node->n_pins ||
+         !slot_indices || !act_rows ||
+         (fused && (!gate_slot_indices ||
+                    gate_pool->wtype != wtype ||
+@@ -2349,8 +2556,20 @@ static int moe_cache_dispatch_internal(
+     }
+ 
+     moe_cache_session & session = *node->session;
+-    moe_cache_device & device = *node->device;
+-    moe_cache_pool & pool = *node->pool;
++    moe_cache_device & device = override_device ? *override_device : *node->device;
++    moe_cache_pool & pool = override_pool ? *override_pool : *node->pool;
++    int32_t local_slots[moe_cache_node_rows_max];
++    int32_t local_gate_slots[moe_cache_node_rows_max];
++    for (int index = 0; index < n_hits; index++) {
++        local_slots[index] = moe_cache_unpack_slot(slot_indices[index]);
++        if (fused) {
++            local_gate_slots[index] = moe_cache_unpack_slot(gate_slot_indices[index]);
++        }
++    }
++    slot_indices = local_slots;
++    if (fused) {
++        gate_slot_indices = local_gate_slots;
++    }
+     if (device.dead.load() || moe_cache_fail(session, "dispatch")) {
+         std::lock_guard<std::mutex> lock(session.mu);
+         device.dispatch_failures++;
+@@ -2538,10 +2757,61 @@ static int moe_cache_dispatch_internal(
+ static int moe_cache_dispatch(
+         void * opaque, int wtype, int64_t n_in, int64_t n_out, int n_hits,
+         const int32_t * slot_indices, const float * const * act_rows) {
+-    return moe_cache_dispatch_internal(
+-            opaque, wtype, n_in, n_out, n_hits,
+-            slot_indices, act_rows, nullptr, nullptr, -1,
+-            0.0f, 0.0f, 0.0f, 0.0f);
++    moe_cache_node * node = (moe_cache_node *)opaque;
++    if (!node || node->dispatched) {
++        return 0;
++    }
++    const int n_lanes = node->n_lanes > 1 ? node->n_lanes : 1;
++    if (n_lanes <= 1) {
++        const int ok = moe_cache_dispatch_internal(
++                opaque, wtype, n_in, n_out, n_hits,
++                slot_indices, act_rows, nullptr, nullptr, -1,
++                0.0f, 0.0f, 0.0f, 0.0f);
++        if (ok) {
++            node->lane_dispatched[0] = true;
++            node->lane_n[0] = n_hits;
++            for (int index = 0; index < n_hits; index++) {
++                node->lane_dst[0][index] = index;
++            }
++        }
++        return ok;
++    }
++
++    int32_t lane_slots[moe_cache_max_lanes][moe_cache_node_rows_max];
++    const float * lane_acts[moe_cache_max_lanes][moe_cache_node_rows_max];
++    for (int lane = 0; lane < n_lanes; lane++) {
++        node->lane_n[lane] = 0;
++        node->lane_dispatched[lane] = false;
++    }
++    for (int index = 0; index < n_hits; index++) {
++        const int lane = moe_cache_unpack_lane(slot_indices[index]);
++        if (lane < 0 || lane >= n_lanes || !node->devices[lane] || !act_rows[index]) {
++            return 0;
++        }
++        const int local = node->lane_n[lane];
++        lane_slots[lane][local] = slot_indices[index];
++        lane_acts[lane][local] = act_rows[index];
++        node->lane_dst[lane][local] = index;
++        node->lane_n[lane]++;
++    }
++
++    int launched = 0;
++    for (int lane = 0; lane < n_lanes; lane++) {
++        if (node->lane_n[lane] <= 0) {
++            continue;
++        }
++        if (!moe_cache_dispatch_internal(
++                opaque, wtype, n_in, n_out, node->lane_n[lane],
++                lane_slots[lane], lane_acts[lane], nullptr, nullptr, -1,
++                0.0f, 0.0f, 0.0f, 0.0f,
++                node->devices[lane], node->pools[lane])) {
++            return 0;
++        }
++        node->lane_dispatched[lane] = true;
++        launched++;
++    }
++    node->dispatched = launched > 0;
++    return launched > 0 ? 1 : 0;
+ }
+ 
+ static int moe_cache_collect(
+@@ -2561,47 +2831,60 @@ static int moe_cache_collect(
+     }
+ 
+     moe_cache_session & session = *node->session;
+-    moe_cache_device & device = *node->device;
+-    ggml_cuda_set_device(device.logical);
+-
+-    bool ok = !device.dead.load();
+-    if (moe_cache_fail(session, "collect")) {
+-        ok = false;
+-    }
+-    const size_t bytes = (size_t)n_hits * n_out * sizeof(float);
+-    if (ok) {
+-        ok = moe_cache_cuda_ok(device, cudaMemcpyAsync(
+-                device.h_out, device.d_out, bytes,
+-                cudaMemcpyDeviceToHost, device.compute_stream), "output download", true);
+-    }
+-    if (ok) {
+-        ok = moe_cache_cuda_ok(
+-                device, cudaStreamSynchronize(device.compute_stream),
+-                "output synchronization", true);
+-    } else {
+-        cudaStreamSynchronize(device.compute_stream);
+-    }
+-    node->dispatched = false;
+-
+-    if (ok) {
+-        for (int index = 0; index < n_hits; index++) {
+-            memcpy(dst_rows[index], device.h_out + (size_t)index * n_out,
+-                   n_out * sizeof(float));
++    const int n_lanes = node->n_lanes > 1 ? node->n_lanes : 1;
++    bool ok = !moe_cache_fail(session, "collect");
++    int collected = 0;
++    for (int lane = 0; lane < n_lanes; lane++) {
++        moe_cache_device * device = n_lanes > 1 ? node->devices[lane] : node->device;
++        const int lane_hits = n_lanes > 1 ? node->lane_n[lane] : n_hits;
++        const bool launched = n_lanes > 1 ? node->lane_dispatched[lane] : true;
++        if (!device || !launched || lane_hits <= 0) {
++            continue;
+         }
+-    }
+-
+-    {
+-        std::lock_guard<std::mutex> lock(session.mu);
+-        if (!ok) {
+-            device.collect_failures++;
++        ggml_cuda_set_device(device->logical);
++        bool lane_ok = ok && !device->dead.load();
++        const size_t bytes = (size_t)lane_hits * n_out * sizeof(float);
++        if (lane_ok) {
++            lane_ok = moe_cache_cuda_ok(*device, cudaMemcpyAsync(
++                    device->h_out, device->d_out, bytes,
++                    cudaMemcpyDeviceToHost, device->compute_stream),
++                    "output download", true);
++        }
++        if (lane_ok) {
++            lane_ok = moe_cache_cuda_ok(
++                    *device, cudaStreamSynchronize(device->compute_stream),
++                    "output synchronization", true);
++        } else {
++            cudaStreamSynchronize(device->compute_stream);
+         }
+-        device.collect_calls++;
+-        if (session.config.stats_every > 0 &&
+-            device.collect_calls % session.config.stats_every == 0) {
+-            moe_cache_log_stats(device);
++        if (lane_ok) {
++            for (int index = 0; index < lane_hits; index++) {
++                const int dst = n_lanes > 1 ? node->lane_dst[lane][index] : index;
++                if (dst < 0 || dst >= n_hits) {
++                    lane_ok = false;
++                    break;
++                }
++                memcpy(dst_rows[dst], device->h_out + (size_t)index * n_out,
++                       n_out * sizeof(float));
++            }
+         }
++        node->lane_dispatched[lane] = false;
++        {
++            std::lock_guard<std::mutex> lock(session.mu);
++            if (!lane_ok) {
++                device->collect_failures++;
++            }
++            device->collect_calls++;
++            if (session.config.stats_every > 0 &&
++                device->collect_calls % session.config.stats_every == 0) {
++                moe_cache_log_stats(*device);
++            }
++        }
++        ok = ok && lane_ok;
++        collected += lane_hits;
+     }
+-    return ok ? 1 : 0;
++    node->dispatched = false;
++    return ok && collected == n_hits ? 1 : 0;
+ }
+ 
+ static void moe_cache_end(void * opaque) {
+@@ -2611,15 +2894,23 @@ static void moe_cache_end(void * opaque) {
+     }
+ 
+     if (node->dispatched) {
+-        ggml_cuda_set_device(node->device->logical);
+-        moe_cache_cuda_ok(
+-                *node->device, cudaStreamSynchronize(node->device->compute_stream),
+-                "end synchronization", true);
++        const int n_lanes = node->n_lanes > 1 ? node->n_lanes : 1;
++        for (int lane = 0; lane < n_lanes; lane++) {
++            moe_cache_device * device = n_lanes > 1 ? node->devices[lane] : node->device;
++            if (!device || (n_lanes > 1 && !node->lane_dispatched[lane])) {
++                continue;
++            }
++            ggml_cuda_set_device(device->logical);
++            moe_cache_cuda_ok(
++                    *device, cudaStreamSynchronize(device->compute_stream),
++                    "end synchronization", true);
++            node->lane_dispatched[lane] = false;
++        }
+         node->dispatched = false;
+     }
+ 
+     moe_cache_session & session = *node->session;
+-    const bool trim = node->device->dead.load();
++    const bool trim = node->device && node->device->dead.load();
+     {
+         std::lock_guard<std::mutex> lock(session.mu);
+         for (int index = 0; index < node->n_pins; index++) {
+@@ -2644,8 +2935,19 @@ static void moe_cache_end(void * opaque) {
+         session.active_nodes--;
+         session.idle_cv.notify_all();
+     }
+-    if (trim && node->dispatch_lock.owns_lock()) {
++    if (node->dispatch_lock.owns_lock()) {
+         node->dispatch_lock.unlock();
++    }
++    const int n_lanes = node->n_lanes > 1 ? node->n_lanes : 0;
++    for (int lane = 0; lane < n_lanes; lane++) {
++        if (node->dispatch_locks[lane].owns_lock()) {
++            node->dispatch_locks[lane].unlock();
++        }
++        if (node->devices[lane] && node->devices[lane]->dead.load()) {
++            moe_cache_trim_session(session, node->devices[lane]->physical);
++        }
++    }
++    if (trim && n_lanes <= 1 && node->device) {
+         moe_cache_trim_session(session, node->device->physical);
+     }
+ }
+@@ -2728,43 +3030,93 @@ static void * moe_cache_fused_begin(
+     moe_cache_device * selected = nullptr;
+     moe_cache_pool * pool = nullptr;
+     int pool_index = -1;
++    moe_cache_device * fused_devices[moe_cache_max_lanes] = {};
++    moe_cache_pool * fused_pools[moe_cache_max_lanes] = {};
++    int fused_pool_indices[moe_cache_max_lanes] = {};
++    int fused_n_lanes = 0;
+     {
+         std::lock_guard<std::mutex> lock(session->mu);
+         if (session->stopping || session->dormant) {
+             return nullptr;
+         }
+ 
+-        auto route_for = [&](const void * tensor) {
+-            const auto tensor_route = session->tensor_devices.find(tensor);
+-            if (tensor_route != session->tensor_devices.end()) {
+-                return tensor_route->second;
++        if (session->config.split_experts) {
++            moe_cache_device * candidates[moe_cache_max_lanes] = {};
++            int n_candidates = 0;
++            for (const auto & device_ptr : session->devices) {
++                if (n_candidates >= moe_cache_max_lanes ||
++                    device_ptr->dead.load()) {
++                    continue;
++                }
++                const int found = moe_cache_find_pool(
++                        *device_ptr, up->expert_size, up->type);
++                if (found < 0 || found >= (int)device_ptr->pools.size() ||
++                    !device_ptr->pools[found]->slab) {
++                    continue;
++                }
++                candidates[n_candidates] = device_ptr.get();
++                fused_pools[n_candidates] = device_ptr->pools[found].get();
++                fused_pool_indices[n_candidates] = found;
++                n_candidates++;
+             }
+-            const auto layer_route = session->layer_devices.find(up_layer);
+-            return layer_route != session->layer_devices.end()
+-                ? layer_route->second : -1;
+-        };
+-        const int up_device = route_for(up->data);
+-        const int gate_device = route_for(gate->data);
+-        if (up_device < 0 || up_device != gate_device) {
+-            return nullptr;
+-        }
+-        for (const auto & device_ptr : session->devices) {
+-            if (device_ptr->physical == up_device) {
+-                selected = device_ptr.get();
+-                break;
++            if (n_candidates >= 2) {
++                for (int left = 0; left < n_candidates; left++) {
++                    for (int right = left + 1; right < n_candidates; right++) {
++                        if (candidates[right]->physical < candidates[left]->physical) {
++                            std::swap(candidates[left], candidates[right]);
++                            std::swap(fused_pools[left], fused_pools[right]);
++                            std::swap(fused_pool_indices[left], fused_pool_indices[right]);
++                        }
++                    }
++                }
++                fused_n_lanes = n_candidates;
++                for (int lane = 0; lane < fused_n_lanes; lane++) {
++                    fused_devices[lane] = candidates[lane];
++                }
++                selected = fused_devices[0];
++                pool = fused_pools[0];
++                pool_index = fused_pool_indices[0];
+             }
+         }
+-        if (!selected || selected->dead.load()) {
+-            return nullptr;
+-        }
+-        pool_index = moe_cache_find_pool(
+-                *selected, up->expert_size, up->type);
+-        if (pool_index < 0 || pool_index >= (int)selected->pools.size()) {
+-            return nullptr;
+-        }
+-        pool = selected->pools[pool_index].get();
+-        if (!pool || !pool->slab) {
+-            return nullptr;
++
++        if (fused_n_lanes < 2) {
++            fused_n_lanes = 0;
++            auto route_for = [&](const void * tensor) {
++                const auto tensor_route = session->tensor_devices.find(tensor);
++                if (tensor_route != session->tensor_devices.end()) {
++                    return tensor_route->second;
++                }
++                const auto layer_route = session->layer_devices.find(up_layer);
++                return layer_route != session->layer_devices.end()
++                    ? layer_route->second : -1;
++            };
++            const int up_device = route_for(up->data);
++            const int gate_device = route_for(gate->data);
++            if (up_device < 0 || up_device != gate_device) {
++                return nullptr;
++            }
++            for (const auto & device_ptr : session->devices) {
++                if (device_ptr->physical == up_device) {
++                    selected = device_ptr.get();
++                    break;
++                }
++            }
++            if (!selected || selected->dead.load()) {
++                return nullptr;
++            }
++            pool_index = moe_cache_find_pool(
++                    *selected, up->expert_size, up->type);
++            if (pool_index < 0 || pool_index >= (int)selected->pools.size()) {
++                return nullptr;
++            }
++            pool = selected->pools[pool_index].get();
++            if (!pool || !pool->slab) {
++                return nullptr;
++            }
++            fused_n_lanes = 1;
++            fused_devices[0] = selected;
++            fused_pools[0] = pool;
++            fused_pool_indices[0] = pool_index;
+         }
+ 
+         auto acquire_source = [&](const void * base) {
+@@ -2806,14 +3158,27 @@ static void * moe_cache_fused_begin(
+     };
+ 
+     std::unique_lock<std::mutex> dispatch_lock;
++    std::unique_lock<std::mutex> fused_locks[moe_cache_max_lanes];
+     try {
+-        dispatch_lock = std::unique_lock<std::mutex>(
+-                selected->dispatch_mu, std::try_to_lock);
++        if (fused_n_lanes > 1) {
++            for (int lane = 0; lane < fused_n_lanes; lane++) {
++                fused_locks[lane] = std::unique_lock<std::mutex>(
++                        fused_devices[lane]->dispatch_mu, std::try_to_lock);
++                if (!fused_locks[lane].owns_lock() ||
++                    fused_devices[lane]->dead.load()) {
++                    release_active();
++                    return nullptr;
++                }
++            }
++        } else {
++            dispatch_lock = std::unique_lock<std::mutex>(
++                    selected->dispatch_mu, std::try_to_lock);
++        }
+     } catch (...) {
+         release_active();
+         return nullptr;
+     }
+-    if (!dispatch_lock.owns_lock() || selected->dead.load()) {
++    if (fused_n_lanes <= 1 && (!dispatch_lock.owns_lock() || selected->dead.load())) {
+         release_active();
+         return nullptr;
+     }
+@@ -2822,6 +3187,15 @@ static void * moe_cache_fused_begin(
+     node->device = selected;
+     node->pool = pool;
+     node->pool_index = pool_index;
++    node->n_lanes = fused_n_lanes;
++    for (int lane = 0; lane < fused_n_lanes; lane++) {
++        node->devices[lane] = fused_devices[lane];
++        node->pools[lane] = fused_pools[lane];
++        node->pool_indices[lane] = fused_pool_indices[lane];
++        if (fused_n_lanes > 1) {
++            node->dispatch_locks[lane] = std::move(fused_locks[lane]);
++        }
++    }
+     node->host_base = up->data;
+     node->host_base2 = gate->data;
+     node->expert_size = up->expert_size;
+@@ -2830,13 +3204,17 @@ static void * moe_cache_fused_begin(
+     node->n_expert = up->n_expert;
+     node->n_tokens = n_tokens;
+     node->wtype = up->type;
+-    node->dispatch_lock = std::move(dispatch_lock);
++    if (fused_n_lanes <= 1) {
++        node->dispatch_lock = std::move(dispatch_lock);
++    }
+     node->planned = true;
+ 
+     int32_t up_slots[moe_cache_node_rows_max];
+     int32_t gate_slots[moe_cache_node_rows_max];
++    int32_t hit_lanes[moe_cache_node_rows_max];
+     int32_t resident_up[moe_cache_node_rows_max];
+     int32_t resident_gate[moe_cache_node_rows_max];
++    int32_t resident_lane[moe_cache_node_rows_max];
+     const float * hit_acts[moe_cache_node_rows_max];
+     uint64_t mask = 0;
+     int hits = 0;
+@@ -2844,54 +3222,72 @@ static void * moe_cache_fused_begin(
+     bool wake_worker = false;
+     {
+         std::unique_lock<std::mutex> lock(session->mu);
+-        if (!session->stopping && !selected->dead.load()) {
++        if (!session->stopping) {
+             for (int index = 0; index < n_ids; index++) {
+                 resident_up[index] = -1;
+                 resident_gate[index] = -1;
++                resident_lane[index] = -1;
+                 const int32_t expert = ids[index];
+                 if (expert < 0 || expert >= up->n_expert) {
+                     continue;
+                 }
+-                const auto up_found = pool->map.find({up->data, expert});
+-                const auto gate_found = pool->map.find({gate->data, expert});
+-                if (up_found != pool->map.end() &&
+-                    pool->slots[up_found->second].state == moe_cache_slot_state::valid) {
+-                    resident_up[index] = up_found->second;
+-                }
+-                if (gate_found != pool->map.end() &&
+-                    pool->slots[gate_found->second].state == moe_cache_slot_state::valid) {
+-                    resident_gate[index] = gate_found->second;
+-                }
+-                if (resident_up[index] >= 0 && resident_gate[index] >= 0) {
+-                    selected->pair_both++;
+-                } else if (resident_up[index] >= 0) {
+-                    selected->pair_up_only++;
+-                } else if (resident_gate[index] >= 0) {
+-                    selected->pair_gate_only++;
+-                } else {
+-                    selected->pair_neither++;
++                for (int lane = 0; lane < fused_n_lanes; lane++) {
++                    moe_cache_device * lane_device = fused_devices[lane];
++                    moe_cache_pool * lane_pool = fused_pools[lane];
++                    if (!lane_device || !lane_pool || lane_device->dead.load()) {
++                        continue;
++                    }
++                    const auto up_found = lane_pool->map.find({up->data, expert});
++                    const auto gate_found = lane_pool->map.find({gate->data, expert});
++                    const int up_slot =
++                        up_found != lane_pool->map.end() &&
++                        lane_pool->slots[up_found->second].state == moe_cache_slot_state::valid
++                            ? up_found->second : -1;
++                    const int gate_slot =
++                        gate_found != lane_pool->map.end() &&
++                        lane_pool->slots[gate_found->second].state == moe_cache_slot_state::valid
++                            ? gate_found->second : -1;
++                    if (up_slot >= 0 && gate_slot >= 0) {
++                        resident_up[index] = up_slot;
++                        resident_gate[index] = gate_slot;
++                        resident_lane[index] = lane;
++                        lane_device->pair_both++;
++                        break;
++                    }
++                    if (up_slot >= 0) {
++                        lane_device->pair_up_only++;
++                    } else if (gate_slot >= 0) {
++                        lane_device->pair_gate_only++;
++                    } else {
++                        lane_device->pair_neither++;
++                    }
+                 }
+             }
+ 
+             for (int index = 0; index < n_ids; index++) {
+-                if (resident_up[index] < 0 || resident_gate[index] < 0) {
++                if (resident_up[index] < 0 || resident_gate[index] < 0 ||
++                    resident_lane[index] < 0) {
+                     continue;
+                 }
+-                moe_cache_slot & up_slot = pool->slots[resident_up[index]];
+-                moe_cache_slot & gate_slot = pool->slots[resident_gate[index]];
++                const int lane = resident_lane[index];
++                moe_cache_pool * lane_pool = fused_pools[lane];
++                moe_cache_device * lane_device = fused_devices[lane];
++                moe_cache_slot & up_slot = lane_pool->slots[resident_up[index]];
++                moe_cache_slot & gate_slot = lane_pool->slots[resident_gate[index]];
+                 up_slot.readers++;
+                 gate_slot.readers++;
+-                moe_cache_lru_remove(*pool, resident_up[index]);
+-                moe_cache_lru_push_back(*pool, resident_up[index]);
+-                moe_cache_lru_remove(*pool, resident_gate[index]);
+-                moe_cache_lru_push_back(*pool, resident_gate[index]);
+-                node->pins[node->n_pins++] = {pool, resident_up[index]};
+-                node->pins[node->n_pins++] = {pool, resident_gate[index]};
+-                up_slots[hits] = resident_up[index];
+-                gate_slots[hits] = resident_gate[index];
++                moe_cache_lru_remove(*lane_pool, resident_up[index]);
++                moe_cache_lru_push_back(*lane_pool, resident_up[index]);
++                moe_cache_lru_remove(*lane_pool, resident_gate[index]);
++                moe_cache_lru_push_back(*lane_pool, resident_gate[index]);
++                node->pins[node->n_pins++] = {lane_pool, resident_up[index]};
++                node->pins[node->n_pins++] = {lane_pool, resident_gate[index]};
++                up_slots[hits] = moe_cache_pack_slot(lane, resident_up[index]);
++                gate_slots[hits] = moe_cache_pack_slot(lane, resident_gate[index]);
++                hit_lanes[hits] = lane;
+                 hit_acts[hits] = act_rows[index];
+                 mask |= UINT64_C(1) << index;
+-                selected->hits += 2;
++                lane_device->hits += 2;
+                 hits++;
+             }
+ 
+@@ -2900,44 +3296,49 @@ static void * moe_cache_fused_begin(
+                     continue;
+                 }
+                 const int32_t expert = ids[index];
+-                if (expert < 0 || expert >= up->n_expert) {
++                const int target = moe_cache_expert_lane(expert, fused_n_lanes);
++                moe_cache_device * lane_device = fused_devices[target];
++                moe_cache_pool * lane_pool = fused_pools[target];
++                const int lane_pool_index = fused_pool_indices[target];
++                if (expert < 0 || expert >= up->n_expert ||
++                    !lane_device || !lane_pool) {
+                     selected->misses += 2;
+                     continue;
+                 }
+ 
+                 const int up_slot = moe_cache_lookup_or_queue_locked(
+-                        *session, *selected, *pool, pool_index,
++                        *session, *lane_device, *lane_pool, lane_pool_index,
+                         up->data, expert, up->expert_size,
+                         inserts_left, wake_worker);
+                 if (up_slot >= 0) {
+-                    moe_cache_slot & slot = pool->slots[up_slot];
++                    moe_cache_slot & slot = lane_pool->slots[up_slot];
+                     slot.readers++;
+-                    moe_cache_lru_remove(*pool, up_slot);
+-                    moe_cache_lru_push_back(*pool, up_slot);
+-                    selected->hits++;
++                    moe_cache_lru_remove(*lane_pool, up_slot);
++                    moe_cache_lru_push_back(*lane_pool, up_slot);
++                    lane_device->hits++;
+                 } else {
+-                    selected->misses++;
++                    lane_device->misses++;
+                 }
+ 
+                 const int gate_slot = moe_cache_lookup_or_queue_locked(
+-                        *session, *selected, *pool, pool_index,
++                        *session, *lane_device, *lane_pool, lane_pool_index,
+                         gate->data, expert, gate->expert_size,
+                         inserts_left, wake_worker);
+                 if (gate_slot >= 0) {
+-                    moe_cache_slot & slot = pool->slots[gate_slot];
++                    moe_cache_slot & slot = lane_pool->slots[gate_slot];
+                     slot.readers++;
+-                    moe_cache_lru_remove(*pool, gate_slot);
+-                    moe_cache_lru_push_back(*pool, gate_slot);
+-                    selected->hits++;
++                    moe_cache_lru_remove(*lane_pool, gate_slot);
++                    moe_cache_lru_push_back(*lane_pool, gate_slot);
++                    lane_device->hits++;
+                 } else {
+-                    selected->misses++;
++                    lane_device->misses++;
+                 }
+ 
+                 if (up_slot >= 0) {
+-                    pool->slots[up_slot].readers--;
++                    lane_pool->slots[up_slot].readers--;
+                 }
+                 if (gate_slot >= 0) {
+-                    pool->slots[gate_slot].readers--;
++                    lane_pool->slots[gate_slot].readers--;
+                 }
+             }
+             if (hits > 0) {
+@@ -2950,10 +3351,53 @@ static void * moe_cache_fused_begin(
+         session->cv.notify_all();
+     }
+ 
+-    if (hits == 0 || !moe_cache_dispatch_internal(
+-            node.get(), up->type, up->n_in, up->n_out, hits,
+-            up_slots, hit_acts, pool, gate_slots, glu_op,
+-            up_min, up_max, gate_min, gate_max)) {
++    bool dispatched = false;
++    if (hits > 0 && fused_n_lanes <= 1) {
++        dispatched = moe_cache_dispatch_internal(
++                node.get(), up->type, up->n_in, up->n_out, hits,
++                up_slots, hit_acts, pool, gate_slots, glu_op,
++                up_min, up_max, gate_min, gate_max) != 0;
++        if (dispatched) {
++            node->lane_dispatched[0] = true;
++            node->lane_n[0] = hits;
++            for (int index = 0; index < hits; index++) {
++                node->lane_dst[0][index] = index;
++            }
++        }
++    } else if (hits > 0) {
++        int32_t lane_up[moe_cache_max_lanes][moe_cache_node_rows_max];
++        int32_t lane_gate[moe_cache_max_lanes][moe_cache_node_rows_max];
++        const float * lane_acts[moe_cache_max_lanes][moe_cache_node_rows_max];
++        for (int lane = 0; lane < fused_n_lanes; lane++) {
++            node->lane_n[lane] = 0;
++        }
++        for (int index = 0; index < hits; index++) {
++            const int lane = hit_lanes[index];
++            const int local = node->lane_n[lane];
++            lane_up[lane][local] = up_slots[index];
++            lane_gate[lane][local] = gate_slots[index];
++            lane_acts[lane][local] = hit_acts[index];
++            node->lane_dst[lane][local] = index;
++            node->lane_n[lane]++;
++        }
++        dispatched = true;
++        for (int lane = 0; lane < fused_n_lanes; lane++) {
++            if (node->lane_n[lane] <= 0) {
++                continue;
++            }
++            if (!moe_cache_dispatch_internal(
++                    node.get(), up->type, up->n_in, up->n_out, node->lane_n[lane],
++                    lane_up[lane], lane_acts[lane], fused_pools[lane],
++                    lane_gate[lane], glu_op, up_min, up_max, gate_min, gate_max,
++                    fused_devices[lane], fused_pools[lane])) {
++                dispatched = false;
++                break;
++            }
++            node->lane_dispatched[lane] = true;
++        }
++        node->dispatched = dispatched;
++    }
++    if (!dispatched) {
+         moe_cache_end(node.release());
+         return nullptr;
+     }
+diff --git a/tests/test-moe-cache.cpp b/tests/test-moe-cache.cpp
+index 567499dc..76f9c975 100644
+--- a/tests/test-moe-cache.cpp
++++ b/tests/test-moe-cache.cpp
+@@ -394,6 +394,7 @@ static void configure_cache(
+     set_env("GGML_CUDA_MOE_CACHE_SERIAL_FILL", nullptr);
+     set_env("GGML_CUDA_MOE_CACHE_DEDICATED_MMV", dedicated_mmv);
+     set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", "0");
++    set_env("GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS", nullptr);
+     set_env("GGML_CUDA_MOE_CACHE_FAIL", fail_stage);
+ }
+ 
+@@ -2625,6 +2626,7 @@ static bool run_route_override(
+     configure_cache(nullptr);
+     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+     set_env("GGML_CUDA_MOE_CACHE_NDEV", "2");
++    set_env("GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS", "0");
+     capture.clear();
+     void * backends[] = { cuda, second_cuda, cpu };
+     void * session = ggml_moe_cache.session_create(backends, 3, nullptr);
+@@ -2694,6 +2696,100 @@ static bool run_route_override(
+     return ok;
+ }
+ 
++static bool run_same_layer_split(
++        ggml_backend_dev_t first_device,
++        ggml_backend_t cuda, ggml_backend_t cpu,
++        log_capture & capture) {
++    ggml_backend_dev_t second_device = find_other_cuda_device(first_device);
++    if (!second_device) {
++        printf("cache-same-layer-split: SKIP (one CUDA device)\n");
++        return true;
++    }
++    const long first_physical = cuda_physical_device(first_device);
++    if (first_physical >= 0 &&
++        first_physical == cuda_physical_device(second_device)) {
++        printf("cache-same-layer-split: SKIP (one physical CUDA device)\n");
++        return true;
++    }
++    ggml_backend_t second_cuda =
++        ggml_backend_dev_init(second_device, nullptr);
++    if (!second_cuda) {
++        fprintf(stderr,
++                "cache-same-layer-split: failed to initialize second device\n");
++        return false;
++    }
++
++    configure_cache(nullptr);
++    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
++    set_env("GGML_CUDA_MOE_CACHE_NDEV", "2");
++    set_env("GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS", "1");
++    set_env("GGML_CUDA_MOE_CACHE_STATS", "1");
++    capture.clear();
++
++    void * backends[] = { cuda, second_cuda, cpu };
++    void * session = ggml_moe_cache.session_create(backends, 3, nullptr);
++    if (!session) {
++        fprintf(stderr, "cache-same-layer-split: failed to create session\n");
++        ggml_backend_free(second_cuda);
++        return false;
++    }
++
++    constexpr int64_t split_n_in = 256;
++    constexpr int64_t split_n_out = 128;
++    constexpr int64_t split_n_expert = 64;
++    const size_t expert_size =
++        ggml_row_size(GGML_TYPE_Q4_0, split_n_in) * split_n_out;
++    std::vector<uint8_t> weights(expert_size * split_n_expert);
++    const char * name = "blk.11.ffn_up_exps.weight";
++
++    ggml_moe_cache.session_enter(session);
++    const bool pool_ready = wait_for_direct_pool(
++            name, weights.data(), expert_size,
++            split_n_in, split_n_out, GGML_TYPE_Q4_0, split_n_expert);
++    bool both_resident = pool_ready;
++    for (int32_t expert = 0; expert < 2 && both_resident; expert++) {
++        (void)direct_plan_one(
++                name, weights.data(), expert_size,
++                split_n_in, split_n_out, GGML_TYPE_Q4_0, split_n_expert, expert);
++        bool hit = false;
++        for (int attempt = 0; attempt < 200 && !hit; attempt++) {
++            hit = direct_plan_one(
++                    name, weights.data(), expert_size,
++                    split_n_in, split_n_out, GGML_TYPE_Q4_0,
++                    split_n_expert, expert) == 1;
++            if (!hit) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            }
++        }
++        both_resident = hit;
++    }
++    const int32_t experts[2] = { 0, 1 };
++    const int hits = both_resident
++        ? direct_plan_many(
++                name, weights.data(), expert_size,
++                split_n_in, split_n_out, GGML_TYPE_Q4_0,
++                split_n_expert, experts, 2)
++        : -1;
++    ggml_moe_cache.session_leave(session);
++    ggml_moe_cache.session_destroy(session);
++    ggml_backend_free(second_cuda);
++
++    const std::string log = capture.get();
++    const bool split_announced = log.find("split-experts=on") != std::string::npos;
++    const bool two_devices = log.find("devices=2") != std::string::npos;
++    const bool both_gpus =
++        log.find("CUDA0 ") != std::string::npos &&
++        log.find("CUDA1 ") != std::string::npos;
++    const bool ok = pool_ready && both_resident && hits == 2 &&
++        split_announced && two_devices && both_gpus;
++    if (!ok) {
++        fprintf(stderr, "cache-same-layer-split: unexpected routing\n%s",
++                log.c_str());
++    }
++    printf("cache-same-layer-split: %s\n", ok ? "OK" : "FAIL");
++    return ok;
++}
++
+ static bool run_admission_policy_once(
+         ggml_backend_t cuda, ggml_backend_t cpu,
+         int new_expert_misses, log_capture & capture) {
+@@ -3109,6 +3205,7 @@ int main() {
+     ok &= run_complete_pool_allocation(cuda, cpu);
+     ok &= run_shared_budget(cuda, cpu, capture);
+     ok &= run_route_override(cuda_device, cuda, cpu, capture);
++    ok &= run_same_layer_split(cuda_device, cuda, cpu, capture);
+     ok &= run_admission_policy(cuda, cpu, capture);
+ 
+     free_graph(clamped_fused_graph);
+-- 
+2.50.1.windows.1
+

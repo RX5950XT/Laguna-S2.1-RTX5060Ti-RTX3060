@@ -1,0 +1,104 @@
+{
+  "apex_compact": {
+    "repo_id": "Myric/Laguna-S-2.1-APEX-GGUF",
+    "revision": "eb56f9092ea4d57d7c82342db8cc4ff5b64b7315",
+    "files": [
+      {
+        "path": "Laguna-S-2.1-APEX-i-compact.gguf",
+        "size": 54370177408,
+        "sha256": "9260ac1759c67d00c0a08139d909ba4d3d99a26247f01a5bbfd9e77a43ccd3b1"
+      },
+      {
+        "path": "laguna-s-2.1-DFlash-Q4_K.gguf",
+        "size": 652160384,
+        "sha256": "f52d624809025c5b0a60570228b3a8f0a1c7379ed0f06f1447c6831d7b4a2fd2"
+      }
+    ]
+  },
+  "apex_subcompact": {
+    "repo_id": "Myric/Laguna-S-2.1-APEX-GGUF",
+    "revision": "eb56f9092ea4d57d7c82342db8cc4ff5b64b7315",
+    "files": [
+      {
+        "path": "Laguna-S-2.1-APEX-i-subcompact.gguf",
+        "size": 47868232320,
+        "sha256": "5c496d773cc8d44da7afb5562c9c444839d0e3b7a6ff306976ba7ba2e0496b62"
+      },
+      {
+        "path": "laguna-s-2.1-DFlash-Q4_K.gguf",
+        "size": 652160384,
+        "sha256": "f52d624809025c5b0a60570228b3a8f0a1c7379ed0f06f1447c6831d7b4a2fd2"
+      }
+    ]
+  },
+  "poolside_baseline": {
+    "repo_id": "poolside/Laguna-S-2.1-GGUF",
+    "revision": "19036076775e9ba6758595f78af99cb976ef8ff0",
+    "files": [
+      {
+        "path": "laguna-s-2.1-Q4_K_M.gguf",
+        "size": 96031829760,
+        "sha256": "a8b55c75714ea73fd90ec85de5defdc0b8d88ca0ad2108343cdd8fc22f7583e4"
+      },
+      {
+        "path": "laguna-s-2.1-DFlash-BF16.gguf",
+        "size": 2233764224,
+        "sha256": "2ee8aa30338d6599bc7a8ce008cc57c56f2c2b2fdc21f6db9ecda203c751bfd4"
+      }
+    ]
+  },
+  "poolside_dflash": {
+    "repo_id": "poolside/Laguna-S-2.1-GGUF",
+    "revision": "19036076775e9ba6758595f78af99cb976ef8ff0",
+    "files": [
+      {
+        "path": "laguna-s-2.1-DFlash-BF16.gguf",
+        "size": 2233764224,
+        "sha256": "2ee8aa30338d6599bc7a8ce008cc57c56f2c2b2fdc21f6db9ecda203c751bfd4"
+      }
+    ]
+  },
+  "unsloth_iq4_xs": {
+    "repo_id": "unsloth/Laguna-S-2.1-GGUF",
+    "revision": "750f92f90cf54159c4d7a610cb7b3e74498e75c6",
+    "files": [
+      {
+        "path": "UD-IQ4_XS/Laguna-S-2.1-UD-IQ4_XS-00001-of-00003.gguf",
+        "size": 3683648,
+        "sha256": "a6378c893a836ee2649fbb24d60e3e9489313bd873fa53c7ffeb814466fe8867"
+      },
+      {
+        "path": "UD-IQ4_XS/Laguna-S-2.1-UD-IQ4_XS-00002-of-00003.gguf",
+        "size": 49820135904,
+        "sha256": "d9d8482e132457db41c8407958bc478dbc4f1389c53e55ae8a8fd48a478142c2"
+      },
+      {
+        "path": "UD-IQ4_XS/Laguna-S-2.1-UD-IQ4_XS-00003-of-00003.gguf",
+        "size": 7742884768,
+        "sha256": "6fde44340ca9be41cddc86661acce1518cbaf08875f0daa6e393b62228b59dbd"
+      }
+    ]
+  },
+  "unsloth_iq3_xxs": {
+    "repo_id": "unsloth/Laguna-S-2.1-GGUF",
+    "revision": "750f92f90cf54159c4d7a610cb7b3e74498e75c6",
+    "files": [
+      {
+        "path": "Laguna-S-2.1-UD-IQ3_XXS.gguf",
+        "size": 44282842016,
+        "sha256": "2d91fd0cdd887b49bdade16018771ea9a0907b608277478748a4b3e4e4f17ff1"
+      }
+    ]
+  },
+  "unsloth_iq2_m": {
+    "repo_id": "unsloth/Laguna-S-2.1-GGUF",
+    "revision": "750f92f90cf54159c4d7a610cb7b3e74498e75c6",
+    "files": [
+      {
+        "path": "Laguna-S-2.1-UD-IQ2_M.gguf",
+        "size": 37268665376,
+        "sha256": "1b88452d0b05b471a37fa4e40af796953de5574ebae140c122860933df65bb29"
+      }
+    ]
+  }
+}

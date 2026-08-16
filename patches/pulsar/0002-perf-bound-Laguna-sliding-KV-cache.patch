@@ -1,0 +1,734 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RX5950XT <123271969+RX5950XT@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 12:14:51 +0800
+Subject: [PATCH 2/6] perf: bound Laguna sliding KV cache
+
+
+diff --git a/crates/engine/src/kv_ring.rs b/crates/engine/src/kv_ring.rs
+new file mode 100644
+index 0000000..0dd595e
+--- /dev/null
++++ b/crates/engine/src/kv_ring.rs
+@@ -0,0 +1,125 @@
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct GqaKvCachePlan {
++    pub(crate) capacity: u32,
++    pub(crate) window: u32,
++    pub(crate) context: u32,
++}
++
++impl GqaKvCachePlan {
++    pub(crate) fn is_ring(self) -> bool {
++        self.capacity < self.context
++    }
++
++    pub(crate) fn accepts_batch(self, n_tok: u32) -> bool {
++        if n_tok == 0 {
++            return false;
++        }
++        !self.is_ring() || n_tok <= self.capacity.saturating_sub(self.window)
++    }
++}
++
++/// Plan a causal GQA cache. Sliding layers reserve one full attention window
++/// plus `max_batch` scratch rows because Pulsar appends a whole prefill batch
++/// before evaluating its causal attention. The slack prevents future rows in
++/// that batch from overwriting keys still visible to its first query row.
++pub(crate) fn gqa_kv_cache_plan(
++    context: u32,
++    window: u32,
++    max_batch: u32,
++) -> Result<GqaKvCachePlan, &'static str> {
++    if context == 0 {
++        return Err("KV context must be non-zero");
++    }
++    if max_batch == 0 {
++        return Err("KV max_batch must be non-zero");
++    }
++    let requested = if window == 0 {
++        context as u64
++    } else {
++        window as u64 + max_batch as u64
++    };
++    let capacity = (context as u64).min(requested) as u32;
++    Ok(GqaKvCachePlan {
++        capacity,
++        window,
++        context,
++    })
++}
++
++/// Bytes in one `(kv_head, position)` cache row for Pulsar's GQA codecs.
++pub(crate) fn gqa_kv_row_bytes(head_dim: u32, kvq: u32) -> Result<usize, &'static str> {
++    if head_dim == 0 {
++        return Err("KV head_dim must be non-zero");
++    }
++    let hd = head_dim as usize;
++    match kvq {
++        0 => hd.checked_mul(4).ok_or("KV row size overflow"),
++        1 | 3 => hd.checked_add(4).ok_or("KV row size overflow"),
++        2 => hd.checked_mul(2).ok_or("KV row size overflow"),
++        4 if head_dim.is_multiple_of(32) => (hd / 32).checked_mul(34).ok_or("KV row size overflow"),
++        5 if head_dim.is_multiple_of(32) => (hd / 32).checked_mul(18).ok_or("KV row size overflow"),
++        4 | 5 => Err("block KV codec requires head_dim divisible by 32"),
++        _ => Err("unknown KV codec"),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{gqa_kv_cache_plan, gqa_kv_row_bytes};
++
++    #[test]
++    fn laguna_256k_swa_uses_window_plus_batch_slack() {
++        let plan = gqa_kv_cache_plan(262_144, 512, 256).unwrap();
++
++        assert_eq!(plan.capacity, 768);
++        assert!(plan.is_ring());
++    }
++
++    #[test]
++    fn full_attention_keeps_the_complete_context() {
++        let plan = gqa_kv_cache_plan(262_144, 0, 256).unwrap();
++
++        assert_eq!(plan.capacity, 262_144);
++        assert!(!plan.is_ring());
++    }
++
++    #[test]
++    fn short_context_does_not_wrap_or_overallocate() {
++        let plan = gqa_kv_cache_plan(256, 512, 256).unwrap();
++
++        assert_eq!(plan.capacity, 256);
++        assert!(!plan.is_ring());
++    }
++
++    #[test]
++    fn ring_capacity_is_safe_for_the_largest_prefill_batch() {
++        let plan = gqa_kv_cache_plan(262_144, 512, 256).unwrap();
++
++        assert!(plan.accepts_batch(256));
++        assert!(!plan.accepts_batch(257));
++    }
++
++    #[test]
++    fn every_gqa_kv_codec_has_the_expected_row_stride() {
++        let strides = (0..=5)
++            .map(|kvq| gqa_kv_row_bytes(128, kvq).unwrap())
++            .collect::<Vec<_>>();
++
++        assert_eq!(strides, vec![512, 132, 256, 132, 136, 72]);
++    }
++
++    #[test]
++    fn block_codecs_reject_partial_blocks() {
++        assert!(gqa_kv_row_bytes(96, 4).is_ok());
++        assert!(gqa_kv_row_bytes(100, 4).is_err());
++        assert!(gqa_kv_row_bytes(100, 5).is_err());
++    }
++
++    #[test]
++    fn invalid_zero_dimensions_are_rejected() {
++        assert!(gqa_kv_cache_plan(0, 512, 256).is_err());
++        assert!(gqa_kv_cache_plan(262_144, 512, 0).is_err());
++        assert!(gqa_kv_row_bytes(0, 0).is_err());
++        assert!(gqa_kv_row_bytes(128, 6).is_err());
++    }
++}
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index f33fe99..4384557 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -13,8 +13,12 @@
+ //! always receive explicit per-slot device pointers, wherever the bytes
+ //! ended up.
+ 
++mod kv_ring;
++
+ #[cfg(any(target_os = "linux", target_os = "windows"))]
+ mod real {
++    use super::kv_ring::{gqa_kv_cache_plan, gqa_kv_row_bytes};
++
+     /// Bytes per GiB. Memory sizes are reported in GiB everywhere so a
+     /// printed number can be compared directly against a card's capacity;
+     /// mixing decimal GB with binary GiB under one "GB" label made a 69MiB
+@@ -4257,6 +4261,10 @@ mod real {
+         sel_dev: i32,
+         kcache: Vec<DeviceBuf>,
+         vcache: Vec<DeviceBuf>,
++        /// Physical row capacity of each KV slot. Laguna sliding-attention
++        /// layers use a bounded ring; full-attention and other families keep
++        /// `ctx`. Allocation, append and attention must use the same value.
++        kv_caps: Vec<u32>,
+         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
+         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
+         /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
+@@ -4900,6 +4908,13 @@ mod real {
+             let s = m.shape;
+             let f32s = |n: u32| DeviceBuf::alloc(n as usize * 4);
+             let n_used = s.n_expert_used as usize;
++            let mb = std::env::var("PULSAR_BATCH")
++                .ok()
++                .and_then(|v| v.parse::<u32>().ok())
++                .unwrap_or(256)
++                .max(1);
++            gqa_kv_cache_plan(ctx, 0, mb)
++                .map_err(|e| format!("pulsar: invalid KV cache plan: {e}"))?;
+             // uniform slab size across gate/up/down on this model; assert at fetch
+             // include the MTP layer: its experts can use a DIFFERENT quant
+             // (blk.80 is Q2_K on the Hy3 recipe, bigger slabs than IQ2_XXS)
+@@ -4970,6 +4985,24 @@ mod real {
+             // The MLA latent cache has its own quantized formats (fp8/fp16,
+             // kvq_lat below) through mla_store_compact_kv/mla_attention.
+             let kv_lat_ok = s.family == Family::Mla;
++            // Only Laguna uses an attention gate together with the 1:3
++            // full/SWA Geom pattern. Keep the first ring patch scoped to it:
++            // Gemma/Inkling/gpt-oss retain their existing full allocation.
++            let layer_kv_cap = |i: usize| -> u32 {
++                let window = m
++                    .geom
++                    .get(i)
++                    .filter(|g| {
++                        g.window != 0
++                            && m.layers
++                                .get(i)
++                                .is_some_and(|layer| layer.attn_gate.is_some())
++                    })
++                    .map_or(0, |g| g.window);
++                gqa_kv_cache_plan(ctx, window, mb)
++                    .expect("ctx and max_batch were validated")
++                    .capacity
++            };
+             // f32 KV projection across exec layers (+ MTP slot), mirroring
+             // the per-layer sizing loop below. Only consulted for kv_ok /
+             // kv_lat_ok families, so the qwen35-dense shape never reaches it.
+@@ -4998,7 +5031,7 @@ mod real {
+                                 Some(g) => (g.n_head_kv as usize, g.head_dim as usize),
+                                 None => (s.n_head_kv as usize, s.head_dim as usize),
+                             };
+-                            2 * hkv * ctx as usize * hd * 4
++                            2 * hkv * layer_kv_cap(i) as usize * hd * 4
+                         }
+                     })
+                     .sum()
+@@ -5095,13 +5128,13 @@ mod real {
+             } else {
+                 0
+             };
+-            let kv_row = |hd: usize| match kvq {
+-                0 => hd * 4,
+-                1 | 3 => hd + 4,      // per-row f32 scale
+-                2 => hd * 2,          // pure fp16
+-                4 => (hd / 32) * 34,  // q8_0: 34 B / 32 elems
+-                5 => (hd / 32) * 18,  // q4_0: 18 B / 32 elems
+-                _ => hd * 4,
++            for hd in std::iter::once(s.head_dim).chain(m.geom.iter().map(|g| g.head_dim)) {
++                gqa_kv_row_bytes(hd, kvq)
++                    .map_err(|e| format!("pulsar: invalid GQA KV layout: {e} (head_dim={hd}, kvq={kvq})"))?;
++            }
++            let kv_row = |hd: usize| {
++                gqa_kv_row_bytes(hd as u32, kvq)
++                    .expect("GQA KV geometry was validated")
+             };
+             // fp8 latent rows carry one f32 scale at the tail, mirroring
+             // the GQA fp8 layout (and mla_lat_stride on the kernel side)
+@@ -5143,7 +5176,7 @@ mod real {
+                 // f32 baseline footprint: GQA/Qwen35 keep one row per head
+                 // per position; Dsv4 keeps one flat latent row per position
+                 // (n_swa raw ring + ctx/ratio compressed rows, per layer)
+-                let (full, packed) = if s.family == Family::Dsv4 {
++                let (full, packed, globally_summed) = if s.family == Family::Dsv4 {
+                     (
+                         (0..s.n_exec_layer as usize + usize::from(m.mtp.is_some()))
+                             .map(|i| {
+@@ -5159,11 +5192,34 @@ mod real {
+                                 (s.n_swa as usize + comp) * kv_row(s.head_dim as usize)
+                             })
+                             .sum(),
++                        true,
+                     )
++                } else if s.family == Family::Gqa {
++                    let slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
++                    let full = (0..slots)
++                        .map(|i| {
++                            let (hkv, hd) = match m.geom.get(i) {
++                                Some(g) => (g.n_head_kv as usize, g.head_dim as usize),
++                                None => (s.n_head_kv as usize, s.head_dim as usize),
++                            };
++                            2 * hkv * ctx as usize * hd * 4
++                        })
++                        .sum();
++                    let packed = (0..slots)
++                        .map(|i| {
++                            let (hkv, hd) = match m.geom.get(i) {
++                                Some(g) => (g.n_head_kv as usize, g.head_dim as usize),
++                                None => (s.n_head_kv as usize, s.head_dim as usize),
++                            };
++                            2 * hkv * layer_kv_cap(i) as usize * kv_row(hd)
++                        })
++                        .sum();
++                    (full, packed, true)
+                 } else {
+                     (
+                         s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4,
+                         (k_bytes + v_bytes) * s.n_exec_layer as usize,
++                        false,
+                     )
+                 };
+                 let name = match kvq {
+@@ -5176,7 +5232,7 @@ mod real {
+                 // Dsv4's full is already ring+comp across all layers (its
+                 // kcache=raw ring, vcache=compressed rows are distinct data,
+                 // not K/V copies); GQA/Qwen35 double for the K and V copies.
+-                let full_gib = if s.family == Family::Dsv4 {
++                let full_gib = if globally_summed {
+                     full as f64 / GIB
+                 } else {
+                     (full * 2 * s.n_exec_layer as usize) as f64 / GIB
+@@ -5236,12 +5292,6 @@ mod real {
+                         .map(|d| d.clamp(1, 15) + 1)
+                         .unwrap_or(0),
+                 );
+-            let mb = std::env::var("PULSAR_BATCH")
+-                .ok()
+-                .and_then(|v| v.parse::<u32>().ok())
+-                .unwrap_or(256)
+-                .max(1);
+-
+             // everything the attn segment touches lives on the attn GPU
+             // when one is set: KV, MLA scratch, q/heads, hop buffers
+             let primary = kernels::get_device();
+@@ -5250,6 +5300,7 @@ mod real {
+             }
+             let mut kcache = Vec::new();
+             let mut vcache = Vec::new();
++            let mut kv_caps = Vec::new();
+             let n_kv_slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
+             let dense_split = m.layer_dev.iter().any(|&d| d != primary);
+             let attn_split = m.attn_layer_dev.windows(2).any(|w| w[0] != w[1]);
+@@ -5305,7 +5356,8 @@ mod real {
+                 } else {
+                     match m.geom.get(i) {
+                         Some(g) => {
+-                            let b = g.n_head_kv as usize * ctx as usize * kv_row(g.head_dim as usize);
++                            let cap = layer_kv_cap(i);
++                            let b = g.n_head_kv as usize * cap as usize * kv_row(g.head_dim as usize);
+                             (b, b)
+                         }
+                         None => (k_bytes, v_bytes),
+@@ -5322,6 +5374,7 @@ mod real {
+                 }
+                 kcache.push(k);
+                 vcache.push(v);
++                kv_caps.push(layer_kv_cap(i));
+             }
+             if dense_split {
+                 kernels::set_device(primary)?;
+@@ -5588,6 +5641,7 @@ mod real {
+                 )?,
+                 kcache,
+                 vcache,
++                kv_caps,
+                 kvq,
+                 kv_devs,
+                 kvq_lat,
+@@ -6190,8 +6244,29 @@ mod real {
+                         } else {
+                             &st.k
+                         };
+-                        kernels::gqa_kv_append(&mut st.kcache[il], ksrc, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
+-                        kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
++                        let kv_cap = st.kv_caps[il];
++                        kernels::gqa_kv_append_windowed(
++                            &mut st.kcache[il],
++                            ksrc,
++                            n_tok,
++                            hkv,
++                            hd,
++                            kv_cap,
++                            pos0,
++                            window,
++                            kvq,
++                        )?;
++                        kernels::gqa_kv_append_windowed(
++                            &mut st.vcache[il],
++                            &st.v,
++                            n_tok,
++                            hkv,
++                            hd,
++                            kv_cap,
++                            pos0,
++                            window,
++                            kvq,
++                        )?;
+                         // gemma scores at scale 1.0 (q is per-head normed);
+                         // inkling at muP 1/head_dim
+                         let scale = if l.ink.is_some() {
+@@ -6237,7 +6312,7 @@ mod real {
+                         } else {
+                             &st.q
+                         };
+-                        kernels::gqa_attention_rel(&mut st.heads, qsrc, &st.kcache[il], &st.vcache[il], n_tok, nh_q, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq, sinks.as_ref())?;
++                        kernels::gqa_attention_rel(&mut st.heads, qsrc, &st.kcache[il], &st.vcache[il], n_tok, nh_q, hkv, hd, kv_cap, pos0, scale, window, rel, rel_ext, kvq, sinks.as_ref())?;
+ 
+                         // laguna: per-head output gate. g_proj gives one
+                         // logit per (token, head); softplus of it scales
+diff --git a/crates/kernels/cuda/gqa_kernels.inc b/crates/kernels/cuda/gqa_kernels.inc
+index f6d43d2..ce7ee0e 100644
+--- a/crates/kernels/cuda/gqa_kernels.inc
++++ b/crates/kernels/cuda/gqa_kernels.inc
+@@ -306,7 +306,9 @@ __global__ static void gqa_attention_kernel(
+         /* one score per thread */
+         float s = -INFINITY;
+         if (tid < chunk) {
+-            const char *krow = kbase + (uint64_t)(base + tid) * kv_stride;
++            const uint32_t logical = base + tid;
++            const uint32_t slot = window != 0u ? logical % cap : logical;
++            const char *krow = kbase + (uint64_t)slot * kv_stride;
+             float ks;
+             float dot = gqa_kdot<KVF>(krow, sq, head_dim, &ks);
+             s = dot * ks * scale;
+@@ -331,7 +333,9 @@ __global__ static void gqa_attention_kernel(
+         for (uint32_t r = 0; r < chunk; r++) {
+             float w = s_w[r];
+             den += w;
+-            const char *vrow = vbase + (uint64_t)(base + r) * kv_stride;
++            const uint32_t logical = base + r;
++            const uint32_t slot = window != 0u ? logical % cap : logical;
++            const char *vrow = vbase + (uint64_t)slot * kv_stride;
+             float wv = w * gqa_vrow_scale<KVF>(vrow, head_dim);
+             for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
+                 acc[k] += wv * gqa_vacc_lane<KVF>(vrow, d, head_dim);
+@@ -426,7 +430,9 @@ __global__ static void gqa_attention_split_kernel(
+         uint32_t chunk = hi - base < 128u ? hi - base : 128u;
+         float s = -INFINITY;
+         if (tid < chunk) {
+-            const char *krow = kbase + (uint64_t)(base + tid) * kv_stride;
++            const uint32_t logical = base + tid;
++            const uint32_t slot = window != 0u ? logical % cap : logical;
++            const char *krow = kbase + (uint64_t)slot * kv_stride;
+             float ks;
+             float dot = gqa_kdot<KVF>(krow, sq, head_dim, &ks);
+             s = dot * ks * scale;
+@@ -447,7 +453,9 @@ __global__ static void gqa_attention_split_kernel(
+         for (uint32_t r = 0; r < chunk; r++) {
+             float w = s_w[r];
+             den += w;
+-            const char *vrow = vbase + (uint64_t)(base + r) * kv_stride;
++            const uint32_t logical = base + r;
++            const uint32_t slot = window != 0u ? logical % cap : logical;
++            const char *vrow = vbase + (uint64_t)slot * kv_stride;
+             float wv = w * gqa_vrow_scale<KVF>(vrow, head_dim);
+             for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
+                 acc[k] += wv * gqa_vacc_lane<KVF>(vrow, d, head_dim);
+@@ -547,6 +555,16 @@ static int gqa_attention_dispatch(
+     return cuda_ok(cudaGetLastError(), "gqa attention launch");
+ }
+ 
++static bool gqa_attention_span_valid(
++        uint32_t cap, uint32_t pos0, uint32_t n_tok, uint32_t window) {
++    if (cap == 0 || n_tok == 0) return false;
++    const uint64_t logical_end = (uint64_t)pos0 + n_tok;
++    if (window == 0u) return logical_end <= cap;
++    if (logical_end <= cap) return true;
++    if (window > cap) return false;
++    return n_tok <= cap - window;
++}
++
+ /* ---- host wrappers ---- */
+ 
+ extern "C" int ds4_gpu_gqa_head_rms_norm_weight(
+@@ -593,7 +611,8 @@ extern "C" int ds4_gpu_gqa_attention(
+         const ds4_gpu_tensor *sinks) {
+     if (!out || !q || !k_cache || !v_cache ||
+         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+-        head_dim == 0 || head_dim > 512u || pos0 + n_tok > cap ||
++        head_dim == 0 || head_dim > 512u ||
++        !gqa_attention_span_valid(cap, pos0, n_tok, window) ||
+         (rel && rel_extent == 0)) {
+         return 0;
+     }
+@@ -839,7 +858,8 @@ extern "C" int ds4_gpu_gqa_attention_fp8(
+     if (!out || !q || !k_cache || !v_cache ||
+         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+         head_dim == 0 || head_dim > 512u || head_dim % 4u != 0 ||
+-        pos0 + n_tok > cap || (rel && rel_extent == 0)) {
++        !gqa_attention_span_valid(cap, pos0, n_tok, window) ||
++        (rel && rel_extent == 0)) {
+         return 0;
+     }
+     return gqa_attention_dispatch<Kvf::FP8>(
+@@ -861,7 +881,8 @@ extern "C" int ds4_gpu_gqa_attention_fp16(
+     if (!out || !q || !k_cache || !v_cache ||
+         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+         head_dim == 0 || head_dim > 512u || head_dim % 2u != 0 ||
+-        pos0 + n_tok > cap || (rel && rel_extent == 0)) {
++        !gqa_attention_span_valid(cap, pos0, n_tok, window) ||
++        (rel && rel_extent == 0)) {
+         return 0;
+     }
+     return gqa_attention_dispatch<Kvf::FP16>(
+@@ -883,7 +904,8 @@ extern "C" int ds4_gpu_gqa_attention_int8(
+     if (!out || !q || !k_cache || !v_cache ||
+         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+         head_dim == 0 || head_dim > 512u || head_dim % 4u != 0 ||
+-        pos0 + n_tok > cap || (rel && rel_extent == 0)) {
++        !gqa_attention_span_valid(cap, pos0, n_tok, window) ||
++        (rel && rel_extent == 0)) {
+         return 0;
+     }
+     return gqa_attention_dispatch<Kvf::INT8>(
+@@ -905,7 +927,8 @@ extern "C" int ds4_gpu_gqa_attention_q8_0(
+     if (!out || !q || !k_cache || !v_cache ||
+         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+         head_dim == 0 || head_dim > 512u || head_dim % 32u != 0 ||
+-        pos0 + n_tok > cap || (rel && rel_extent == 0)) {
++        !gqa_attention_span_valid(cap, pos0, n_tok, window) ||
++        (rel && rel_extent == 0)) {
+         return 0;
+     }
+     return gqa_attention_dispatch<Kvf::Q8_0>(
+@@ -927,7 +950,8 @@ extern "C" int ds4_gpu_gqa_attention_q4_0(
+     if (!out || !q || !k_cache || !v_cache ||
+         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+         head_dim == 0 || head_dim > 512u || head_dim % 32u != 0 ||
+-        pos0 + n_tok > cap || (rel && rel_extent == 0)) {
++        !gqa_attention_span_valid(cap, pos0, n_tok, window) ||
++        (rel && rel_extent == 0)) {
+         return 0;
+     }
+     return gqa_attention_dispatch<Kvf::Q4_0>(
+diff --git a/crates/kernels/cuda/pulsar_kernels.cu b/crates/kernels/cuda/pulsar_kernels.cu
+index a736d04..3b7b059 100644
+--- a/crates/kernels/cuda/pulsar_kernels.cu
++++ b/crates/kernels/cuda/pulsar_kernels.cu
+@@ -5340,7 +5340,7 @@ extern "C" int pulsar_gqa_rope(
+                             factors ? &ft : NULL);
+ }
+ 
+-extern "C" int pulsar_gqa_kv_append(
++static int pulsar_gqa_kv_append_segment(
+         void *cache, const void *kv, uint32_t n_tok, uint32_t n_kv_head,
+         uint32_t head_dim, uint32_t cap, uint32_t pos0, uint32_t kvq) {
+     ds4_gpu_tensor ct = shim(cache), kt = shim(kv);
+@@ -5366,6 +5366,36 @@ extern "C" int pulsar_gqa_kv_append(
+     }
+ }
+ 
++extern "C" int pulsar_gqa_kv_append(
++        void *cache, const void *kv, uint32_t n_tok, uint32_t n_kv_head,
++        uint32_t head_dim, uint32_t cap, uint32_t pos0, uint32_t window,
++        uint32_t kvq) {
++    if (!cache || !kv || n_tok == 0 || n_kv_head == 0 || head_dim == 0 || cap == 0)
++        return 0;
++    const uint64_t logical_end = (uint64_t)pos0 + n_tok;
++    if (window == 0) {
++        if (logical_end > cap) return 0;
++    } else if (logical_end > cap) {
++        if (window > cap) return 0;
++        /* Pulsar appends the complete prefill batch before causal attention.
++         * Once the logical stream has wrapped, the physical ring therefore
++         * needs one full window plus n_tok scratch rows. */
++        if (n_tok > cap - window) return 0;
++    }
++
++    const uint32_t physical = pos0 % cap;
++    const uint32_t first = n_tok < cap - physical ? n_tok : cap - physical;
++    if (!pulsar_gqa_kv_append_segment(
++            cache, kv, first, n_kv_head, head_dim, cap, physical, kvq))
++        return 0;
++    if (first == n_tok) return 1;
++
++    const uint64_t input_row_bytes = (uint64_t)n_kv_head * head_dim * sizeof(float);
++    const void *tail = (const char *)kv + (uint64_t)first * input_row_bytes;
++    return pulsar_gqa_kv_append_segment(
++            cache, tail, n_tok - first, n_kv_head, head_dim, cap, 0, kvq);
++}
++
+ extern "C" int pulsar_gqa_attention(
+         void *out, const void *q, const void *k_cache, const void *v_cache,
+         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+@@ -5407,7 +5437,149 @@ extern "C" int pulsar_gqa_attention(
+     }
+ }
+ 
+-extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }
++/* Laguna SWA regression: append a batch across the physical ring boundary,
++ * then run causal attention for every row in that batch. K is zero so the
++ * expected result is the average of the visible V rows after decoding the
++ * actual cache bytes. Running all six codecs proves that the shared split
++ * append and the codec-specific attention readers agree on modulo addressing. */
++static int pulsar_gqa_ring_selftest(void) {
++    const uint32_t n_head = 2, n_kv_head = 1, hd = 32;
++    const uint32_t window = 4, cap = 7, pos0 = 6, n_tok = 3;
++    const uint32_t seed_tok = 6;
++    const uint64_t q_elems = (uint64_t)n_tok * n_head * hd;
++    const uint64_t seed_elems = (uint64_t)seed_tok * n_kv_head * hd;
++    const uint64_t cur_elems = (uint64_t)n_tok * n_kv_head * hd;
++    float *q = (float *)calloc(q_elems, sizeof(float));
++    float *seed_k = (float *)calloc(seed_elems, sizeof(float));
++    float *cur_k = (float *)calloc(cur_elems, sizeof(float));
++    float *seed_v = (float *)malloc(seed_elems * sizeof(float));
++    float *cur_v = (float *)malloc(cur_elems * sizeof(float));
++    for (uint32_t t = 0; t < seed_tok; t++)
++        for (uint32_t d = 0; d < hd; d++) seed_v[(uint64_t)t * hd + d] = (float)(t + 1u);
++    for (uint32_t t = 0; t < n_tok; t++)
++        for (uint32_t d = 0; d < hd; d++) cur_v[(uint64_t)t * hd + d] = (float)(pos0 + t + 1u);
++
++    void *g_q = NULL, *g_seed_k = NULL, *g_seed_v = NULL;
++    void *g_cur_k = NULL, *g_cur_v = NULL, *g_out = NULL;
++    int alloc_ok = cudaMalloc(&g_q, q_elems * sizeof(float)) == cudaSuccess
++        && cudaMalloc(&g_seed_k, seed_elems * sizeof(float)) == cudaSuccess
++        && cudaMalloc(&g_seed_v, seed_elems * sizeof(float)) == cudaSuccess
++        && cudaMalloc(&g_cur_k, cur_elems * sizeof(float)) == cudaSuccess
++        && cudaMalloc(&g_cur_v, cur_elems * sizeof(float)) == cudaSuccess
++        && cudaMalloc(&g_out, q_elems * sizeof(float)) == cudaSuccess;
++    if (!alloc_ok) {
++        fprintf(stderr, "gqa-selftest ring: CUDA alloc failed\n");
++        free(q); free(seed_k); free(seed_v); free(cur_k); free(cur_v);
++        if (g_q) cudaFree(g_q); if (g_seed_k) cudaFree(g_seed_k);
++        if (g_seed_v) cudaFree(g_seed_v); if (g_cur_k) cudaFree(g_cur_k);
++        if (g_cur_v) cudaFree(g_cur_v); if (g_out) cudaFree(g_out);
++        return 0;
++    }
++    cudaMemcpy(g_q, q, q_elems * sizeof(float), cudaMemcpyHostToDevice);
++    cudaMemcpy(g_seed_k, seed_k, seed_elems * sizeof(float), cudaMemcpyHostToDevice);
++    cudaMemcpy(g_seed_v, seed_v, seed_elems * sizeof(float), cudaMemcpyHostToDevice);
++    cudaMemcpy(g_cur_k, cur_k, cur_elems * sizeof(float), cudaMemcpyHostToDevice);
++    cudaMemcpy(g_cur_v, cur_v, cur_elems * sizeof(float), cudaMemcpyHostToDevice);
++
++    auto f16_ref = [](uint16_t h) -> float {
++        uint32_t sign = (uint32_t)(h >> 15) & 1u;
++        uint32_t exp = (uint32_t)(h >> 10) & 0x1Fu;
++        uint32_t mant = (uint32_t)h & 0x3FFu;
++        uint32_t bits;
++        if (exp == 0u) {
++            if (mant == 0u) bits = sign << 31;
++            else {
++                uint32_t e = 0u;
++                while ((mant & 0x400u) == 0u) { mant <<= 1; e++; }
++                mant &= 0x3FFu;
++                bits = (sign << 31) | ((127u - 14u - e) << 23) | (mant << 13);
++            }
++        } else if (exp == 31u) {
++            bits = (sign << 31) | (0xFFu << 23) | (mant << 13);
++        } else {
++            bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
++        }
++        float f; memcpy(&f, &bits, sizeof(f)); return f;
++    };
++    auto row_bytes = [=](uint32_t kvq) -> uint32_t {
++        if (kvq == 1u || kvq == 3u) return hd + 4u;
++        if (kvq == 2u) return hd * 2u;
++        if (kvq == 4u) return (hd / 32u) * 34u;
++        if (kvq == 5u) return (hd / 32u) * 18u;
++        return hd * 4u;
++    };
++    auto decode = [&](const uint8_t *row, uint32_t d, uint32_t kvq) -> float {
++        if (kvq == 0u) { float v; memcpy(&v, row + d * 4u, 4); return v; }
++        if (kvq == 1u) { float s; memcpy(&s, row + hd, 4); return e4m3_dec_common(row[d]) * s; }
++        if (kvq == 2u) { uint16_t h; memcpy(&h, row + d * 2u, 2); return f16_ref(h); }
++        if (kvq == 3u) { float s; memcpy(&s, row + hd, 4); return (float)((const int8_t *)row)[d] * s; }
++        const uint32_t i = d & 31u;
++        const uint32_t block = d >> 5;
++        const uint32_t bs = kvq == 4u ? 34u : 18u;
++        const uint8_t *b = row + block * bs;
++        uint16_t h; memcpy(&h, b, 2);
++        const float scale = f16_ref(h);
++        if (kvq == 4u) return scale * (float)((const int8_t *)(b + 2u))[i];
++        const uint8_t packed = b[2u + (i & 15u)];
++        const uint32_t shift = ((i >> 4) & 1u) << 2;
++        return scale * ((float)((packed >> shift) & 0xFu) - 8.0f);
++    };
++
++    int all_ok = 1;
++    for (uint32_t kvq = 0; kvq <= 5; kvq++) {
++        const uint32_t stride = row_bytes(kvq);
++        const uint64_t cache_bytes = (uint64_t)n_kv_head * cap * stride;
++        void *g_kc = NULL, *g_vc = NULL;
++        int ok = cudaMalloc(&g_kc, cache_bytes) == cudaSuccess
++            && cudaMalloc(&g_vc, cache_bytes) == cudaSuccess;
++        if (ok) {
++            cudaMemset(g_kc, 0, cache_bytes);
++            cudaMemset(g_vc, 0, cache_bytes);
++            ok = pulsar_gqa_kv_append(g_kc, g_seed_k, seed_tok, n_kv_head, hd, cap, 0, window, kvq)
++                && pulsar_gqa_kv_append(g_vc, g_seed_v, seed_tok, n_kv_head, hd, cap, 0, window, kvq)
++                && pulsar_gqa_kv_append(g_kc, g_cur_k, n_tok, n_kv_head, hd, cap, pos0, window, kvq)
++                && pulsar_gqa_kv_append(g_vc, g_cur_v, n_tok, n_kv_head, hd, cap, pos0, window, kvq)
++                && !pulsar_gqa_kv_append(g_kc, g_cur_k, cap - window + 1u, n_kv_head, hd, cap, pos0, window, kvq)
++                && pulsar_gqa_attention(g_out, g_q, g_kc, g_vc, n_tok, n_head, n_kv_head,
++                                        hd, cap, pos0, 1.0f, window, NULL, 0, kvq, NULL)
++                && cudaDeviceSynchronize() == cudaSuccess;
++        }
++        uint8_t *vc = (uint8_t *)malloc(cache_bytes);
++        float *out = (float *)malloc(q_elems * sizeof(float));
++        if (ok) ok = cudaMemcpy(vc, g_vc, cache_bytes, cudaMemcpyDeviceToHost) == cudaSuccess
++                  && cudaMemcpy(out, g_out, q_elems * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
++        float diff = 0.0f;
++        if (ok) {
++            for (uint32_t t = 0; t < n_tok; t++) {
++                const uint32_t logical_end = pos0 + t + 1u;
++                const uint32_t logical_begin = logical_end - window;
++                float expected = 0.0f;
++                for (uint32_t r = logical_begin; r < logical_end; r++) {
++                    const uint8_t *row = vc + (uint64_t)(r % cap) * stride;
++                    expected += decode(row, 0, kvq) / (float)window;
++                }
++                for (uint32_t h = 0; h < n_head; h++)
++                for (uint32_t d = 0; d < hd; d++)
++                    diff = fmaxf(diff, fabsf(out[((uint64_t)t * n_head + h) * hd + d] - expected));
++            }
++        } else diff = INFINITY;
++        const int pass = ok && diff < 1e-4f;
++        fprintf(stderr, "gqa-selftest ring kvq=%u: %s (max diff %.2e)\n",
++                kvq, pass ? "PASS" : "FAIL", diff);
++        if (!pass) all_ok = 0;
++        free(vc); free(out);
++        if (g_kc) cudaFree(g_kc); if (g_vc) cudaFree(g_vc);
++    }
++
++    free(q); free(seed_k); free(seed_v); free(cur_k); free(cur_v);
++    cudaFree(g_q); cudaFree(g_seed_k); cudaFree(g_seed_v);
++    cudaFree(g_cur_k); cudaFree(g_cur_v); cudaFree(g_out);
++    return all_ok;
++}
++
++extern "C" int pulsar_gqa_selftest(void) {
++    return ds4_gpu_gqa_selftest() && pulsar_gqa_ring_selftest();
++}
+ 
+ #include "mla_kernels.inc"
+ 
+diff --git a/crates/kernels/src/lib.rs b/crates/kernels/src/lib.rs
+index 70d1bc8..5873d7e 100644
+--- a/crates/kernels/src/lib.rs
++++ b/crates/kernels/src/lib.rs
+@@ -114,7 +114,7 @@ mod real {
+         fn pulsar_add_bias_rows(x: *mut c_void, bias: *const c_void, dim: u32, rows: u32) -> i32;
+         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
+         fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
+-        fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> i32;
++        fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, window: u32, kvq: u32) -> i32;
+         fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: *const c_void, rel_extent: u32, kvq: u32, sinks: *const c_void) -> i32;
+ 
+         fn pulsar_sconv(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_tok: u32, w: u32, k: u32) -> i32;
+@@ -1041,7 +1041,15 @@ mod real {
+     /// 5 = q4_0. Opt-in via PULSAR_KV=<fmt>; row stride per format.
+     #[allow(clippy::too_many_arguments)]
+     pub fn gqa_kv_append(cache: &mut DeviceBuf, kv: &DeviceBuf, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> Result {
+-        check(unsafe { pulsar_gqa_kv_append(cache.ptr_mut(), kv.ptr(), n_tok, n_kv_head, head_dim, cap, pos0, kvq) }, "gqa_kv_append")
++        gqa_kv_append_windowed(cache, kv, n_tok, n_kv_head, head_dim, cap, pos0, 0, kvq)
++    }
++
++    /// Append to a bounded sliding-window cache. `cap` is the physical row
++    /// count and must include enough batch slack for the append-before-attend
++    /// execution order; `pos0` remains the absolute logical token position.
++    #[allow(clippy::too_many_arguments)]
++    pub fn gqa_kv_append_windowed(cache: &mut DeviceBuf, kv: &DeviceBuf, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, window: u32, kvq: u32) -> Result {
++        check(unsafe { pulsar_gqa_kv_append(cache.ptr_mut(), kv.ptr(), n_tok, n_kv_head, head_dim, cap, pos0, window, kvq) }, "gqa_kv_append")
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+-- 
+2.50.1.windows.1
+

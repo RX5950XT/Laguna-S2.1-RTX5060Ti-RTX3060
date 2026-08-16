@@ -1,0 +1,435 @@
+{
+  "schema_version": 1,
+  "context_size": 262144,
+  "minimum_decode_tps": 20.0,
+  "model": "models/apex_compact/Laguna-S-2.1-APEX-i-compact.gguf",
+  "runtime": "build/llama.cpp-moe-cache-v2/bin/llama-bench.exe",
+  "output_root": "benchmarks/moe-cache-search/tuning-v1",
+  "n_gen": 256,
+  "n_gen_warmup": 256,
+  "screen_repetitions": 1,
+  "confirm_repetitions": 3,
+  "base": {
+    "threads": 8,
+    "poll": 50,
+    "batch": 2048,
+    "ubatch": 512,
+    "n_cpu_moe": 48,
+    "moe_cache": "12288",
+    "repack": "off",
+    "tensor_split": "1/0",
+    "main_gpu": 0,
+    "load_mode": "mmap"
+  },
+  "arms": [
+    { "name": "baseline", "stage": "screen" },
+    { "name": "ubatch-8", "stage": "screen", "ubatch": 8 },
+    { "name": "ubatch-128", "stage": "screen", "ubatch": 128 },
+    { "name": "ubatch-256", "stage": "screen", "ubatch": 256 },
+    { "name": "threads-6", "stage": "screen", "threads": 6 },
+    { "name": "cache-4096", "stage": "screen", "moe_cache": "4096" },
+    {
+      "name": "reserve-2560",
+      "stage": "screen",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2560" }
+    },
+    {
+      "name": "reserve-2048",
+      "stage": "screen",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    { "name": "split-3-1", "stage": "screen", "tensor_split": "3/1" },
+    {
+      "name": "main-gpu-1",
+      "stage": "screen",
+      "tensor_split": "0/1",
+      "main_gpu": 1
+    },
+    { "name": "ncmoe-47", "stage": "screen", "n_cpu_moe": 47 },
+    { "name": "ncmoe-46", "stage": "screen", "n_cpu_moe": 46 },
+    { "name": "load-none", "stage": "screen", "load_mode": "none" },
+    { "name": "threads-4", "stage": "screen", "threads": 4 },
+    { "name": "threads-10", "stage": "screen", "threads": 10 },
+    { "name": "threads-12", "stage": "screen", "threads": 12 },
+    { "name": "poll-25", "stage": "screen", "poll": 25 },
+    { "name": "poll-75", "stage": "screen", "poll": 75 },
+    {
+      "name": "t6-ub128",
+      "stage": "screen",
+      "threads": 6,
+      "ubatch": 128
+    },
+    {
+      "name": "t6-reserve2048",
+      "stage": "screen",
+      "threads": 6,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "ub128-reserve2048",
+      "stage": "screen",
+      "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "t6-ub128-reserve2048",
+      "stage": "screen",
+      "threads": 6,
+      "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "t6-ub128-reserve2048-ncmoe47",
+      "stage": "screen",
+      "threads": 6,
+      "ubatch": 128,
+      "n_cpu_moe": 47,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-overlap-0",
+      "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS": "0"
+      }
+    },
+    {
+      "name": "winner-overlap-1",
+      "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS": "1"
+      }
+    },
+    {
+      "name": "winner-overlap-2",
+      "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS": "2"
+      }
+    },
+    {
+      "name": "winner-overlap-3",
+      "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS": "3"
+      }
+    },
+    {
+      "name": "winner-overlap-4",
+      "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS": "4"
+      }
+    },
+    {
+      "name": "winner-dedicated-mmv",
+      "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_DEDICATED_MMV": "1"
+      }
+    },
+    {
+      "name": "winner-admit-3",
+      "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_ADMIT_AFTER": "3"
+      }
+    },
+    {
+      "name": "winner-throttle-16",
+      "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_THROTTLE": "16"
+      }
+    },
+    {
+      "name": "winner-threads-4", "stage": "screen", "threads": 4, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-threads-8", "stage": "screen", "threads": 8, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-threads-10", "stage": "screen", "threads": 10, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-threads-12", "stage": "screen", "threads": 12, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-poll-0", "stage": "screen", "threads": 6, "poll": 0, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-poll-25", "stage": "screen", "threads": 6, "poll": 25, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-poll-75", "stage": "screen", "threads": 6, "poll": 75, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-poll-100", "stage": "screen", "threads": 6, "poll": 100, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-reserve-1792", "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "1792" }
+    },
+    {
+      "name": "winner-reserve-1536", "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "1536" }
+    },
+    {
+      "name": "winner-load-none", "stage": "screen", "threads": 6, "ubatch": 128, "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "winner-cache-cuda0-only", "stage": "screen", "threads": 6, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_NDEV": "1"
+      }
+    },
+    {
+      "name": "fine-threads-2", "stage": "screen", "threads": 2, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "fine-threads-3", "stage": "screen", "threads": 3, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "fine-threads-5", "stage": "screen", "threads": 5, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "fine-threads-7", "stage": "screen", "threads": 7, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "fine-t4-ub64", "stage": "screen", "threads": 4, "ubatch": 64,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "fine-t4-ub96", "stage": "screen", "threads": 4, "ubatch": 96,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "fine-t4-ub160", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "fine-t4-ub192", "stage": "screen", "threads": 4, "ubatch": 192,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "fine-t4-reserve1536", "stage": "screen", "threads": 4, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "1536" }
+    },
+    {
+      "name": "fine-t4-admit3", "stage": "screen", "threads": 4, "ubatch": 128,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_ADMIT_AFTER": "3"
+      }
+    },
+    {
+      "name": "fine-t4-ub160-load-none", "stage": "screen", "threads": 4, "ubatch": 160,
+      "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "confirm-t4-ub160", "stage": "confirm", "threads": 4, "ubatch": 160,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "confirm-t4-ub192", "stage": "confirm", "threads": 4, "ubatch": 192,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "confirm-t6-ub128", "stage": "confirm", "threads": 6, "ubatch": 128,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "loadnone-t3", "stage": "screen", "threads": 3, "ubatch": 160, "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "loadnone-t5", "stage": "screen", "threads": 5, "ubatch": 160, "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "loadnone-t6", "stage": "screen", "threads": 6, "ubatch": 160, "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "loadnone-ub128", "stage": "screen", "threads": 4, "ubatch": 128, "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "loadnone-ub192", "stage": "screen", "threads": 4, "ubatch": 192, "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "loadnone-reserve1536", "stage": "screen", "threads": 4, "ubatch": 160, "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "1536" }
+    },
+    {
+      "name": "loadnone-admit3", "stage": "screen", "threads": 4, "ubatch": 160, "load_mode": "none",
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_ADMIT_AFTER": "3"
+      }
+    },
+    {
+      "name": "confirm-loadnone-t4-ub160", "stage": "confirm", "threads": 4, "ubatch": 160, "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "confirm-loadnone-t4-ub128", "stage": "confirm", "threads": 4, "ubatch": 128, "load_mode": "none",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "auto-repack", "stage": "screen", "threads": 4, "ubatch": 160,
+      "moe_cache": "auto", "repack": "on",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "auto-repack-t6", "stage": "screen", "threads": 6, "ubatch": 160,
+      "moe_cache": "auto", "repack": "on",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "auto-repack-ub128", "stage": "screen", "threads": 4, "ubatch": 128,
+      "moe_cache": "auto", "repack": "on",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "auto-norepack", "stage": "screen", "threads": 4, "ubatch": 160,
+      "moe_cache": "auto", "repack": "off",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "split-31-1", "stage": "screen", "threads": 4, "ubatch": 160,
+      "tensor_split": "31/1",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "split-15-1", "stage": "screen", "threads": 4, "ubatch": 160,
+      "tensor_split": "15/1",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "split-7-1", "stage": "screen", "threads": 4, "ubatch": 160,
+      "tensor_split": "7/1",
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048" }
+    },
+    {
+      "name": "serial-fill", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_SERIAL_FILL": "1"
+      }
+    },
+    {
+      "name": "inserts-1", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_INSERTS": "1"
+      }
+    },
+    {
+      "name": "inserts-2", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_INSERTS": "2"
+      }
+    },
+    {
+      "name": "inserts-4", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_INSERTS": "4"
+      }
+    },
+    {
+      "name": "confirm-serial-fill", "stage": "confirm", "threads": 4, "ubatch": 160,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_SERIAL_FILL": "1"
+      }
+    },
+    {
+      "name": "stats-16", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048", "GGML_CUDA_MOE_CACHE_STATS": "16" }
+    },
+    {
+      "name": "stats-32", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048", "GGML_CUDA_MOE_CACHE_STATS": "32" }
+    },
+    {
+      "name": "stats-64", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048", "GGML_CUDA_MOE_CACHE_STATS": "64" }
+    },
+    {
+      "name": "stats-128", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048", "GGML_CUDA_MOE_CACHE_STATS": "128" }
+    },
+    {
+      "name": "stats-256", "stage": "screen", "threads": 4, "ubatch": 160,
+      "environment": { "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048", "GGML_CUDA_MOE_CACHE_STATS": "256" }
+    },
+    {
+      "name": "split-experts",
+      "stage": "confirm",
+      "threads": 4,
+      "ubatch": 160,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS": "1"
+      }
+    },
+    {
+      "name": "layer-pin",
+      "stage": "confirm",
+      "threads": 4,
+      "ubatch": 160,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS": "0"
+      }
+    },
+    {
+      "name": "fused-down",
+      "stage": "confirm",
+      "threads": 4,
+      "ubatch": 160,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS": "1"
+      }
+    },
+    {
+      "name": "collect-overlap",
+      "stage": "confirm",
+      "threads": 4,
+      "ubatch": 160,
+      "environment": {
+        "GGML_CUDA_MOE_CACHE_RESERVE_MB": "2048",
+        "GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS": "1",
+        "GGML_CUDA_MOE_CACHE_STATS": "64"
+      }
+    }
+  ]
+}

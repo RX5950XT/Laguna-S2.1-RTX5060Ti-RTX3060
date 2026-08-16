@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RX5950XT <123271969+RX5950XT@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 13:06:20 +0800
+Subject: [PATCH 6/6] feat: run Pulsar API server on Windows
+
+
+diff --git a/crates/serve/src/main.rs b/crates/serve/src/main.rs
+index 963df0c..a8dc1d2 100644
+--- a/crates/serve/src/main.rs
++++ b/crates/serve/src/main.rs
+@@ -10,13 +10,13 @@
+ //! ponytail: hand-rolled HTTP/1.1 on TcpListener; an async framework
+ //! buys nothing for a sequential localhost server.
+ 
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+ fn main() {
+-    eprintln!("pulsar-serve requires Linux + CUDA");
++    eprintln!("pulsar-serve requires Linux/Windows + CUDA");
+     std::process::exit(1);
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn main() {
+     if let Err(e) = run() {
+         eprintln!("pulsar-serve: {e}");
+@@ -26,19 +26,19 @@ fn main() {
+ 
+ /// Self-contained chat webui (vanilla JS, no build step). Served at `/`
+ /// alongside the API; same origin as `/v1/chat/completions`, so no CORS.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ const WEBUI_HTML: &str = include_str!("../webui/index.html");
+ 
+ /// Inline SVG favicon (the pulsar dot) — keeps the browser console clean
+ /// instead of 404-ing on /favicon.ico.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ const FAVICON_SVG: &str = include_str!("../webui/favicon.svg");
+ 
+ /// MCP client hub (rmcp). Gated to linux like the rest of the server; the
+ /// feature is opt-in via --webui-mcp-proxy, which enables the /mcp/* routes,
+ /// tool injection, and the webui MCP tab. Without the flag this module is
+ /// unused and behavior is unchanged.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ mod mcp;
+ 
+ /// Multi-format tool-call parsers (generic JSON, Hy3 opensource, DeepSeek DSML).
+@@ -86,15 +86,20 @@ fn ctx_fit(ctx: u32, kv_bytes: usize, kv_compact: bool, reclaimable: usize) -> u
+ /// KV storage format this process was launched with; "auto" when unset,
+ /// which lets the engine's size-aware default pick (exact f32 while the
+ /// projection is small, fp8 once it would starve the expert cache).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn kv_format() -> String {
+     std::env::var("PULSAR_KV").unwrap_or_else(|_| "auto".into())
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn run() -> engine::Result {
+     use std::io::{BufRead, BufReader, Read, Write};
+ 
++    #[cfg(target_os = "windows")]
++    if let Ok(delay) = std::env::var("PULSAR_REEXEC_DELAY_MS") {
++        std::thread::sleep(std::time::Duration::from_millis(delay.parse().unwrap_or(500)));
++    }
++
+     let mut model_path = None;
+     let mut port = 11435u16;
+     let mut host = String::from("127.0.0.1");
+@@ -893,7 +898,7 @@ fn run() -> engine::Result {
+ 
+ /// True when the bind address keeps the server off the network entirely.
+ /// Only then is a Host allowlist both safe to impose and worth imposing.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn is_loopback_bind(bind_host: &str) -> bool {
+     matches!(bind_host, "localhost" | "::1" | "[::1]") || bind_host.starts_with("127.")
+ }
+@@ -909,7 +914,7 @@ fn is_loopback_bind(bind_host: &str) -> bool {
+ /// real usability and buy nothing. Setting PULSAR_ALLOWED_HOSTS forces the
+ /// strict path back on regardless of bind, for a public bind that still wants
+ /// a fixed set of names.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn allowed_hosts(bind_host: &str, port: u16) -> Option<Vec<String>> {
+     let explicit = std::env::var("PULSAR_ALLOWED_HOSTS")
+         .ok()
+@@ -950,7 +955,7 @@ fn allowed_hosts(bind_host: &str, port: u16) -> Option<Vec<String>> {
+ /// True when the request's `Host` is one we answer to. A missing Host is
+ /// allowed (HTTP/1.0 clients omit it); browsers always send one, so a
+ /// rebinding attack can never present as absent.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn host_allowed(host: Option<&str>, allowed: Option<&Vec<String>>) -> bool {
+     let Some(allowed) = allowed else { return true };
+     let Some(h) = host else { return true };
+@@ -971,7 +976,7 @@ fn host_allowed(host: Option<&str>, allowed: Option<&Vec<String>>) -> bool {
+ /// ponytail: authority string compare, no URL parser. A reverse proxy that
+ /// rewrites Host without rewriting Origin still 403s here; PULSAR_ALLOWED_HOSTS
+ /// does not cover that case, and the fix would be a matching origin allowlist.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn origin_ok(origin: Option<&str>, host: Option<&str>) -> bool {
+     let Some(origin) = origin else { return true };
+     let authority = origin
+@@ -984,7 +989,7 @@ fn origin_ok(origin: Option<&str>, host: Option<&str>) -> bool {
+     }
+ }
+ 
+-#[cfg(all(test, target_os = "linux"))]
++#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+ mod tests {
+     use super::{allowed_hosts, host_allowed, origin_ok};
+ 
+@@ -1045,7 +1050,7 @@ mod tests {
+     }
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn respond_json(
+     stream: &mut std::net::TcpStream,
+     status: u16,
+@@ -1148,10 +1153,15 @@ fn pretty_model_name(name: &str) -> String {
+     }
+ }
+ 
+-/// the caller to be a .gguf inside the current model's directory.
+-#[cfg(target_os = "linux")]
+-fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>, mtp: bool, kv: Option<&str>) -> std::io::Error {
+-    use std::os::unix::process::CommandExt;
++/// Build the replacement command after the caller validates the model path.
++#[cfg(any(target_os = "linux", target_os = "windows"))]
++fn reexec_command(
++    newmodel: &std::path::Path,
++    cpu_lane: bool,
++    new_ctx: Option<u32>,
++    mtp: bool,
++    kv: Option<&str>,
++) -> std::process::Command {
+     let args: Vec<String> = std::env::args().collect();
+     let mut cmd = std::process::Command::new(&args[0]);
+     let mut i = 1;
+@@ -1193,9 +1203,29 @@ fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>, mtp:
+         Some(v) => { cmd.env("PULSAR_KV", v); }
+         None => {}
+     }
++    cmd
++}
++
++/// Replace this process on Unix so the listening socket is released atomically.
++#[cfg(target_os = "linux")]
++fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>, mtp: bool, kv: Option<&str>) -> std::io::Error {
++    use std::os::unix::process::CommandExt;
++    let mut cmd = reexec_command(newmodel, cpu_lane, new_ctx, mtp, kv);
+     cmd.exec()
+ }
+ 
++/// Windows has no exec(2). Start a delayed replacement, then terminate the
++/// current process so the child can bind the same port without a race.
++#[cfg(target_os = "windows")]
++fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>, mtp: bool, kv: Option<&str>) -> std::io::Error {
++    let mut cmd = reexec_command(newmodel, cpu_lane, new_ctx, mtp, kv);
++    cmd.env("PULSAR_REEXEC_DELAY_MS", "500");
++    match cmd.spawn() {
++        Ok(_) => std::process::exit(0),
++        Err(error) => error,
++    }
++}
++
+ /// Whether the AVX2 CPU expert lane is enabled in this process.
+ fn cpu_lane_on() -> bool {
+     std::env::var_os("PULSAR_CPU").is_some_and(|v| v != "0" && !v.is_empty())
+@@ -1235,7 +1265,7 @@ fn gpu_info() -> Vec<(String, u64, u64)> {
+ }
+ 
+ /// Raw bytes response with an explicit content-type (static assets, etc).
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn respond_bytes(
+     stream: &mut std::net::TcpStream,
+     status: u16,
+@@ -1257,7 +1287,7 @@ fn respond_bytes(
+ /// (Claude Code / Anthropic-translated clients send
+ /// [{type:"text", text:...}, ...]); a string-only read silently
+ /// dropped the whole system prompt for those clients
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn message_text_of(content: &serde_json::Value) -> String {
+     match content {
+         serde_json::Value::String(s) => s.clone(),
+@@ -1279,7 +1309,7 @@ fn message_text_of(content: &serde_json::Value) -> String {
+ }
+ 
+ /// Pick Jinja or ChatMarkers encoding for a message list.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ #[allow(clippy::too_many_arguments)] // one call site; the request fields do not want a struct
+ fn encode_messages_auto(
+     tok: &tokenizer::Tokenizer,
+@@ -1315,7 +1345,7 @@ fn encode_messages_auto(
+ 
+ /// Encode OpenAI messages via a resolved Jinja chat template, then
+ /// tokenize with special-token recognition.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn encode_messages_jinja(
+     tok: &tokenizer::Tokenizer,
+     template: &tokenizer::ResolvedChatTemplate,
+@@ -1414,7 +1444,7 @@ fn encode_messages_jinja(
+ /// Encode OpenAI messages as a Hy3 context: bos, system text, then per
+ /// turn user/assistant markers; past assistant turns carry empty think
+ /// tags and a trailing eos, exactly like the model's chat template.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn encode_messages(
+     tok: &tokenizer::Tokenizer,
+     m: &tokenizer::ChatMarkers,
+@@ -1519,7 +1549,7 @@ fn encode_messages(
+ 
+ /// Split generated text into (visible text, parsed tool calls).
+ /// Unclosed or unparseable blocks stay in the text untouched.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ /// Split harmony channel output into (reasoning, reply).
+ ///
+ /// gpt-oss answers on named channels: `analysis` carries its chain of
+@@ -1580,13 +1610,13 @@ fn extract_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
+     tool_calls::extract_tool_calls(text)
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ #[allow(clippy::too_many_arguments)]
+ /// Recompute the prefix-cache common-prefix length for a turn's prompt and, on
+ /// divergence, rewind the recurrent state to the nearest checkpoint. Same
+ /// logic as the initial prefix block in handle_chat, factored out so the
+ /// non-stream agentic loop can call it once per turn.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ fn prefix_common(
+     model: &engine::Model,
+     st: &mut engine::State,
+@@ -1617,7 +1647,7 @@ fn prefix_common(
+     Ok(common)
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "windows"))]
+ #[allow(clippy::too_many_arguments)] // one call site; the request fields do not want a struct
+ fn handle_chat(
+     stream: &mut std::net::TcpStream,
+-- 
+2.50.1.windows.1
+
