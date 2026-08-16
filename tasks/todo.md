@@ -12,6 +12,7 @@
 ## 階段 1：盤點與專案邊界
 
 - [x] 建立 Git repo、`AGENTS.md`、`CLAUDE.md`、`CONTEXT.md` 與任務文件。
+- [x] 強化 `.gitignore` 排除規則（排除大型模型、專案快取、建置目錄、第三方原始碼、benchmark 產物、敏感檔與測試快取）並完成 initial commit。
 - [x] 確認 GPU、VRAM、RAM、driver、磁碟與現有 toolchain。
 - [x] 鎖定 DDR4-2133 為穩定上限，排除 XMP／記憶體超頻。
 - [x] 產生可重跑的硬體與路徑清冊。
@@ -106,3 +107,4 @@
 - 2026-08-14：collect prefetch + fused down。帶 `-v` p5 `17.99`，INFO-only p5 `19.32`。`test-moe-cache` 全過。續跑時 RTX 3060 `GPU is lost`，未完成 10x。
 - 2026-08-14：確認 3060 故障並暫停 20 tok/s 工作。重開機後 `nvidia-smi` 為 5060 Ti 16GB + 3070 Ti 8GB。已清 DFlash 草稿、`.audit-build`、`.cache`、Web UI `node_modules`、Pulsar `target`／worktree 與暫存；正式 GGUF、MoE-cache binary 與 winner 證據保留。
 - 2026-08-15：磁碟只留 APEX i-compact。已刪 subcompact（44.58GB）與 IQ4_XS（53.61GB）；manifest 保留，需要時用 `scripts/download-model.ps1` 重抓。
+- 2026-08-16：完成 Git 存放庫初始化，強化 `.gitignore` 排除規則（包含 `models/`, `.cache/`, `tmp/`, `logs/`, `build/`, `third_party/`, `benchmarks/moe-*/`, `benchmarks/results/`, `.pytest_cache/`, `.coverage`, 敏感檔案等），驗證 53 項單元測試全數通過並建立 initial commit。
