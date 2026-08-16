@@ -26,6 +26,7 @@
 - 官方 Q4_K_M 實檔 `96,031,829,760` bytes；尚未為形式驗收下載。
 - 磁碟上只留 APEX i-compact（50.64GB）。subcompact 與 IQ4_XS 已刪；checksum 仍在 `config/models.json`，品質門檻或 Pulsar 對照時再下載。
 - 完成 Git 存放庫初始化與 `.gitignore` 排除規則強化（包含大型模型、快取、暫存、build、third_party、搜尋與日誌產物、pytest 快取、敏感檔案等），全套 53 個單元測試均通過並建立 initial commit。
+- 建立 GitHub 存放庫 `RX5950XT/Laguna-S2.1-RTX5060Ti-RTX3060` 並推送至 `main` 分支。
 
 ## 判定
 

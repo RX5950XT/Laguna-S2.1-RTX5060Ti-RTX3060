@@ -90,6 +90,12 @@
 - [x] 專案外大型檔案路徑稽核；本任務模型、cache、tmp、build 與結果均在專案內。
 - [x] 完成 README、CONTEXT 與本檔 review。
 
+## 階段 7：遠端版本控制 (GitHub)
+
+- [x] 建立 GitHub 存放庫 `RX5950XT/Laguna-S2.1-RTX5060Ti-RTX3060`。
+- [x] 設定遠端 `origin` 並推送到 `main` 分支。
+- [x] 驗證遠端 repo、gitignore 排除項與同步狀態。
+
 ## Review
 
 - 2026-08-13：完成初始規劃。容量可行；主要不確定性是 DDR4-2133 下的 MoE expert streaming 吞吐，必須以 DFlash 與 GPU/CPU 分工實測，不以估算宣稱達標。
@@ -108,3 +114,4 @@
 - 2026-08-14：確認 3060 故障並暫停 20 tok/s 工作。重開機後 `nvidia-smi` 為 5060 Ti 16GB + 3070 Ti 8GB。已清 DFlash 草稿、`.audit-build`、`.cache`、Web UI `node_modules`、Pulsar `target`／worktree 與暫存；正式 GGUF、MoE-cache binary 與 winner 證據保留。
 - 2026-08-15：磁碟只留 APEX i-compact。已刪 subcompact（44.58GB）與 IQ4_XS（53.61GB）；manifest 保留，需要時用 `scripts/download-model.ps1` 重抓。
 - 2026-08-16：完成 Git 存放庫初始化，強化 `.gitignore` 排除規則（包含 `models/`, `.cache/`, `tmp/`, `logs/`, `build/`, `third_party/`, `benchmarks/moe-*/`, `benchmarks/results/`, `.pytest_cache/`, `.coverage`, 敏感檔案等），驗證 53 項單元測試全數通過並建立 initial commit。
+- 2026-08-16：建立 GitHub 存放庫 `RX5950XT/Laguna-S2.1-RTX5060Ti-RTX3060` 並推送至 `main` 分支。
