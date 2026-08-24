@@ -25,3 +25,8 @@
 - 3060 故障後槽位可能變成 3070 Ti 8GB。8GB 卡不能當 12GB MoE-cache 驗收替代；換卡前暫停雙卡 10x，不要在錯誤硬體上硬跑。
 - Windows 清 `.cache` 時 cargo 套件可能有超長路徑；`rd /s /q` 失敗後改用 `\\?\` 前綴再刪。
 - 20 tok/s 路徑只需要 APEX i-compact。subcompact（Pulsar）與 IQ4_XS（品質候選）可刪；`config/models.json` 當重抓目錄，不要為了以後可能用到就佔一百多 GB。
+
+## 2026-08-21
+
+- 3060 無法修復、槽位變成 8GB 時應**封存倉庫**，不要在錯誤硬體上續跑。解封條件寫進 `tasks/todo.md`，不要另留一份 `handoff.md` 當第二個真相來源。
+

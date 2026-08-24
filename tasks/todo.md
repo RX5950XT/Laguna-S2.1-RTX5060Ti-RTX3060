@@ -1,13 +1,58 @@
 # Laguna S 2.1 部署計畫
 
+## 封存（2026-08-21）
+
+本倉庫**封存**。RTX 3060 12GB 故障，重開機後槽位是 RTX 3070 Ti **8GB**，不能當 12GB MoE-cache 雙卡驗收。要換 **≥12GB** 的第二張卡才解封。
+
+- 封存期間：**不要**跑雙卡 10x、不要再掃 CLI、不要在 8GB 卡上硬測 20 tok/s。
+- 暫停前最快雙卡：**fused-down、INFO-only、無 STATS、p5 19.32 tok/s**（19.506 / 19.6213 / 19.3222，平均 19.483）。離 20 約 3%。帶 `-v` 為 p5 17.99。**10x 未跑。**
+- 解封 SOP、winner 旋鈕與禁止事項見下方「解封後接續」。歷史階段與 review 仍保留。
+
+## 解封後接續
+
+解封條件：`nvidia-smi` 為 GPU0 RTX 5060 Ti 16GB，**GPU1 ≥12GB 且健康**。若仍是 8GB／lost／只剩一張卡：**停止**。
+
+Winner（原樣重跑，不要再轉旋鈕）：
+
+| 項目 | 值 |
+|---|---|
+| 模型 | `models/apex_compact/Laguna-S-2.1-APEX-i-compact.gguf`（50.64 GB，APEX i-compact，不是官方 Q4_K_M） |
+| context | **262144**（禁止縮短 context／輸出） |
+| KV | K 與 V 皆 **Q4_0**（`-ctk q4_0 -ctv q4_0`） |
+| MoE-cache | 12288 MiB，reserve 2048 MiB |
+| threads / ubatch / n_cpu_moe | 4 / 160 / 48 |
+| load | mmap |
+| split | `GGML_CUDA_MOE_CACHE_SPLIT_EXPERTS=1`（fused-down + CUDA graph） |
+
+```powershell
+.\scripts\tune-moe-cache.ps1 -Stage confirm -Case fused-down
+```
+
+用 **pwsh** 直接跑；不要用 `powershell.exe`（UTF-8 繁中會壞）。官方 tune **不要加 `-v`**。
+
+依序：
+
+1. fused-down 256K r3。不得比 19.32／17.99 慢。
+2. 兩次**獨立啟動** 10x（warmup 256、`-n 256`、`n_ctx=262144`）。兩次 p5 都 ≥ 20。一次過一次掛不算。
+3. 每次證據鏈：stderr `llama_context: n_ctx = 262144`、MoE-cache enabled、JSON `n_ctx=262144`、`samples_ts` 長度符合、fill/dispatch/collect fail=0。
+4. JSON/log 寫進 `benchmarks/` 與 `CONTEXT.md`。
+
+若 10x 仍 < 20：**禁止再掃 CLI**。下一刀有 profile 再切 scheduler 的 attn↔MoE host bounce，或把獨立 shared-expert CUDA 疊進剩餘 collect wait（collect-wait 約 1.6 ms/token，不是主因）。一次一刀；失敗或沒增益就完整撤回。不得留下比 split p5 14.59 更慢的 winner。
+
+解封後仍不做（另案）：30 分鐘 soak、260K+512、thinking／tool／完整 `/v1`、Q4 KV <5% 品質、下載 96GB 官方 Q4、復活 DFlash、把 Pulsar 22.4 當成本機成果。
+
+禁止：8GB 當 12GB 替代、縮 ctx／縮輸出湊 TPS、XMP／記憶體超頻、`-v` DEBUG 當正式數字、單卡數字當雙卡驗收。
+
+速度路徑（皆 256K + Q4_0 KV + i-compact）：baseline ~7.23 → Pulsar ~4.06 → cache p5 12.09 → layer-pin **14.12** → split **14.59** → fused-down `-v` **17.99** → INFO **19.32**。已淘汰 `n_cpu_moe=47/46`、DFlash。
+
 ## 驗收門檻
 
 - [ ] 服務實際回報 `n_ctx = 262144`，約 260K prompt 可完成至少 512-token generation。
-- [ ] 暖機後 10 次單 request decode 的低分位吞吐（p5）`>= 20 tok/s`。
+- [ ] 暖機後 10 次單 request decode 的低分位吞吐（p5）`>= 20 tok/s`。**封存中。**
 - [ ] 30 分鐘 soak 無 crash、OOM 或持續熱降頻。
 - [ ] 相對官方 Q4 基準：perplexity、coding pass@1 與長文 retrieval 損失均 `< 5%`。
 - [ ] `/v1/models`、chat completion、streaming、thinking、tool calling 全部通過。
-- [ ] 模型、cache、tmp、build 與 benchmark 大型產物都位於專案內。
+- [x] 模型、cache、tmp、build 與 benchmark 大型產物都位於專案內。
 
 ## 階段 1：盤點與專案邊界
 
@@ -27,14 +72,14 @@
 
 - [x] 將所有 cache/temp 環境變數固定在專案內。
 - [x] 下載並驗證 APEX i-compact、Unsloth IQ4_XS 與兩款 DFlash checksum/revision。
-- [ ] 視品質基準需求下載官方 96.03GB Q4_K_M；不得沿用過時的 68GB 容量估計。
+- [ ] 視品質基準需求下載官方 96.03GB Q4_K_M；不得沿用過時的 68GB 容量估計。**封存中。**
 - [x] 盤點較緊湊候選量化；只有品質損失 `<5%` 才可採用。
 
 ## 階段 4：功能與基準
 
-- [ ] 小 context 驗證 chat template、thinking、tool parser、UTF-8 與 streaming。
-- [ ] 建立官方 Q4 的品質與效能基準。
-- [ ] 建立自動調校與逐 token timestamp／資源遙測。
+- [ ] 小 context 驗證 chat template、thinking、tool parser、UTF-8 與 streaming。**封存中（另案）。**
+- [ ] 建立官方 Q4 的品質與效能基準。**封存中（另案）。**
+- [ ] 建立自動調校與逐 token timestamp／資源遙測。**封存中。**
 
 ## 階段 5：256K 與效能搜尋
 
@@ -43,14 +88,14 @@
 - [x] A/B 測試兩款 DFlash；因低 acceptance 與明顯降速而停用。
 - [x] 稽核 Pulsar hot-expert placement 與 KTransformers 可行性。
 - [x] 實作支援 Laguna 256K SWA KV 的 Windows Pulsar per-expert 後端，並驗證另一套 llama.cpp MoE-cache。
-- [ ] 淘汰未通過 `<5%` 品質門檻的低位元候選。
+- [ ] 淘汰未通過 `<5%` 品質門檻的低位元候選。**封存中（另案）。**
 
 ## 階段 5.1：組合拳極限優化實測 (KV Q4 + Hot Cache 擴展)
 
 - [x] 實驗 A：Q4_0 KV 將 KV VRAM 由約 6.45GiB 降到約 3.41GiB。
 - [x] 實驗 B：GPU0 cache 由 1.8GiB 增到 4.9GiB，hit 提升到 77.9%；GPU1 hit 79.2%。
 - [x] 實驗 C：固定 256K、256-token warmup、三次 256-token decode 與 cache teardown 遙測。
-- [ ] 實驗 D：評估 KV Cache Q4 對於品質與 PPL 損耗之影響是否 `< 5%`。
+- [ ] 實驗 D：評估 KV Cache Q4 對於品質與 PPL 損耗之影響是否 `< 5%`。**封存中（另案）。**
 - [x] 實驗 E：Q4 p5 僅 `12.09 tok/s`，未達 15/20，依預設停止門檻不執行 30 分鐘假驗收。
 
 ## 階段 5.3：同層雙 GPU expert split
@@ -67,26 +112,20 @@
 - [x] `fused_begin_ex` 把 down MMV 接在 fused swiglu 後面；CPU fusion 自動偵測 GLU→down。`cache-fused-down` 通過。
 - [x] 256K r3（`-v`）：`18.0075 / 18.1243 / 17.9905`，p5 `17.99`。INFO-only：`19.506 / 19.6213 / 19.3222`，p5 `19.32`。`n_ctx=262144`，failure=0。
 - [x] fused-down kernel 序列收成 CUDA graph；`cache-fused-down` 要求 `graph-replays>0`。
-- [ ] p5 `>=20`。**硬體暫停**：3060 故障，重開機後槽位是 3070 Ti 8GB，不能當 12GB 替代。等換卡後再跑兩次 10x。
+- [ ] p5 `>=20`。**封存**：3060 故障，槽位是 3070 Ti 8GB。換 ≥12GB 卡後依「解封後接續」跑 r3 與兩次 10x。
 
 ## 階段 5.2：MoE-cache 系統化逼近 20 tok/s
 
-- [ ] 建立 `config/moe-cache-search.json` 與 `scripts/tune-moe-cache.ps1`，固定 256K、Q4 speed path、專案內輸出、失敗隔離與可續跑 manifest。
-- [ ] 修正 benchmark 證據鏈：每個 arm 必須由 runtime log 證明 `n_ctx=262144`、KV 容量、cache granted、完整 generation 與 failure=0。
-- [ ] 第一層低成本篩選：`ubatch={8,128,256,512}`、`batch={8,2048}`、threads `{6,8}`；不重測無意義的獨立 `threads-batch`。
-- [ ] 第二層 VRAM／拓撲篩選：cache `{4096,12288}`、reserve `{3072,2560,2048}`、split `{1/0,3/1,0/1}`、main GPU `{0,1}`、`NDEV={1,2}`。
-- [ ] 第三層 CPU／MoE 篩選：`n_cpu_moe={48,47,46}` 與 load mode `{mmap,none}`；只有 46 層改善且 VRAM 有餘裕才追加 44。
-- [ ] 對前三名測 cache policy：admission/readmission、`OVERLAP_CPU_ROWS={auto,0,1,2}` 與 `DEDICATED_MMV={0,1}`；queue/serial fill 只有在遙測證明 backlog/failure 時才測。
-- [ ] 採 sequential halving：r1 落後最佳逾 8% 即淘汰；前兩名跑 r3；winner 跑 10x512 並計算 p5、CV 與 bootstrap CI。
-- [ ] 若 winner p5 `>=15 tok/s` 或相對 `12.09` 提升 `>=20%`，才進 backend profiling；否則先用 NVTX/CUDA events 與 Nsight 建 Amdahl 上限。
-- [ ] profiling 只選一個已證明的瓶頸做 tests-first 修正：device-aware placement、admission/LRU、pinned staging/async copy 或 Q3_K/Q4_K MMV kernel。
-- [ ] 每個 backend patch 必須 targeted stage `>=10%`、端到端 p5 `>=5%` 且 95% CI 無退步；否則完整撤回。
-- [ ] 速度達標後才執行 Q4 KV `<5%` 品質 gate、10 次 p5、260K+512、30 分鐘 soak 與 API 全功能驗收。
+**已取代／取消。** CLI sequential-halving 搜尋已跑過並收斂到 t=4／ub=160／ncmoe=48；後續改走 5.3／5.4 backend。封存期間不要重開這輪搜尋。腳本與 `config/moe-cache-search.json` 仍保留供解封後 confirm。
+
+- [x] 建立 `config/moe-cache-search.json` 與 `scripts/tune-moe-cache.ps1`。
+- [x] 參數層收斂；正式路徑改 fused-down confirm，不再掃 ubatch／threads／n_cpu_moe=47/46。
+- [ ] 速度達標後才執行 Q4 KV `<5%` 品質 gate、10 次 p5、260K+512、30 分鐘 soak 與 API 全功能驗收。**封存中。**
 
 ## 階段 6：最終驗收
 
-- [ ] 260K long-context、10 次吞吐與 30 分鐘 soak。
-- [ ] 品質差異報告與 OpenAI-compatible API 驗證。
+- [ ] 260K long-context、10 次吞吐與 30 分鐘 soak。**封存中。**
+- [ ] 品質差異報告與 OpenAI-compatible API 驗證。**封存中（另案）。**
 - [x] 專案外大型檔案路徑稽核；本任務模型、cache、tmp、build 與結果均在專案內。
 - [x] 完成 README、CONTEXT 與本檔 review。
 
@@ -115,3 +154,4 @@
 - 2026-08-15：磁碟只留 APEX i-compact。已刪 subcompact（44.58GB）與 IQ4_XS（53.61GB）；manifest 保留，需要時用 `scripts/download-model.ps1` 重抓。
 - 2026-08-16：完成 Git 存放庫初始化，強化 `.gitignore` 排除規則（包含 `models/`, `.cache/`, `tmp/`, `logs/`, `build/`, `third_party/`, `benchmarks/moe-*/`, `benchmarks/results/`, `.pytest_cache/`, `.coverage`, 敏感檔案等），驗證 53 項單元測試全數通過並建立 initial commit。
 - 2026-08-16：建立 GitHub 存放庫 `RX5950XT/Laguna-S2.1-RTX5060Ti-RTX3060` 並推送至 `main` 分支。
+- 2026-08-21：將 `tasks/handoff.md` 併入本檔「解封後接續」並刪除 handoff。倉庫因 3060 故障、只能改換 ≥12GB 第二張卡而**封存**。winner 仍是 fused-down INFO p5 19.32；10x 未跑。
