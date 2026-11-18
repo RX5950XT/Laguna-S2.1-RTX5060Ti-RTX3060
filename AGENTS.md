@@ -9,5 +9,5 @@
 - 本機 DDR4-2133 是已確認的穩定上限；禁止啟用 XMP 或記憶體超頻。
 - 雙卡 20 tok/s 驗收必須是 RTX 5060 Ti 16GB + 12GB 級第二張卡；8GB 卡不得當作 3060 替代。
 - 修改規劃與進度記錄於 `tasks/todo.md`，使用者修正與可重用教訓記錄於 `tasks/lessons.md`。
-- 每次任務完成後同步精簡維護 `AGENTS.md`、`CLAUDE.md` 與 `CONTEXT.md`。
+- 每次任務完成後同步精簡維護 `AGENTS.md`、`CLAUDE.md`，交接資訊更新 `tasks/todo.md`（≤100 行）。
 - 不可硬編碼 secrets；服務預設只監聽 `127.0.0.1`。
